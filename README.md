@@ -15,8 +15,8 @@
 1. 克隆仓库或下载脚本
 
 ```bash
-git clone <your-repo-url>
-cd <repo>
+git clone https://github.com/lights-think/Amazon-Scraping.git
+cd Amazon-Scraping
 ```
 
 2. 安装依赖
@@ -30,6 +30,8 @@ pip install -r requirements.txt
 ```bash
 playwright install
 ```
+
+> 注意：脚本默认使用系统 Chrome，可执行路径为 Windows: `C:\Program Files\Google\Chrome\Application\chrome.exe`，如安装路径不同，请修改 `amazon_scraper.py` 中 `executable_path` 参数。
 
 ## 使用
 
