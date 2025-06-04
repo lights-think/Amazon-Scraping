@@ -8,6 +8,7 @@
 - 进度条显示（tqdm）
 - CSV 输入/输出
 - 支持主流国家：US、UK、DE、FR、ES、IT、CA、JP、MX、IN
+- 支持抓取 Vine 评论数量和最后三条评论的平均评分（输出字段 `vine_count`、`latest3_rating`）。
 
 ## 安装
 
@@ -34,15 +35,19 @@ playwright install
 
 ```bash
 # 对 CSV 文件（使用并发参数示例）
-python amazon_scraper.py -i input.csv -o output.csv -e utf-8 -s '\t' -c 10
+python amazon_scraper.py -i input.csv -o output.csv -e utf-8 -s '\t' -c 10 -p my_browser_profile
 
 # 对 Excel 文件 (.xls/.xlsx)
-python amazon_scraper.py -i input.xlsx -o output.csv
+python amazon_scraper.py -i input.xlsx -o output.csv -p my_browser_profile
 ```
 
 - `input.csv`/`input.xlsx` 应包含 `ASIN` 和 `country` 列
 - 对 CSV 文件，可通过 `-e`/`--encoding` 指定输入文件编码（默认 `utf-8`)，通过 `-s`/`--sep` 指定分隔符（默认 `,`)
 - 可通过 `-c`/`--concurrency` 指定并发任务数（默认 5）
+- 可通过 `-p`/`--profile-dir` 指定用户数据目录（默认 `my_browser_profile`），用于持久化浏览器登录信息。
+
+首次运行时如未检测到登录状态，脚本会打开可视化浏览器进行登录 Vine 评论页面，登录完成后会保存登录状态，后续运行无需重复登录。
+
 - 输出文件 `output.csv` 将包含抓取结果：
   - `bsr_main_category`：主分类名称
   - `bsr_main_rank`：主分类排名
@@ -50,6 +55,8 @@ python amazon_scraper.py -i input.xlsx -o output.csv
   - `bsr_sub_rank`：子分类排名
   - `rating`：平均评分
   - `review_count`：评论数量
+  - `vine_count`：Vine 评论数量
+  - `latest3_rating`：最后一页前三条评论的平均评分
 
 ## 定期启动
 

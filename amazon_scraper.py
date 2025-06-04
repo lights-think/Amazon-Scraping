@@ -224,8 +224,9 @@ async def fetch_vine_count(page, asin, domain):
     # 限制最多抓取 10 页评论
     total_pages = min(total_pages, 10)
 
-    # 遍历所有页面，依次统计 Vine 评论数量
+    # 初始化 Vine 评论计数和最后一页前三条评论平均评分
     vine_count = 0
+    latest3_rating = 0.0  # 存储最后一页前三条评论的平均评分
     previous_first_review_text = "INITIAL_DUMMY_VALUE_FOR_FIRST_PAGE_COMPARISON_DO_NOT_MATCH_REAL_TEXT" # Initialize
 
     for page_num in range(1, total_pages + 1):
@@ -288,11 +289,29 @@ async def fetch_vine_count(page, asin, domain):
         except Exception as e_js:
             logging.error(f"ASIN={asin} - Error on page {page_num} JS eval: {e_js}")
 
+        # 如果是最后一页，则计算前三条评论的平均评分
+        if page_num == total_pages:
+            try:
+                avg_rating = await page.evaluate(r'''() => {
+                    const stars = Array.from(document.querySelectorAll('i[data-hook="review-star-rating"] span.a-icon-alt'));
+                    const nums = stars.slice(0, 3).map(el => {
+                        const m = el.textContent.match(/(\d+(?:\.\d+)?)/);
+                        return m ? parseFloat(m[1]) : 0;
+                    });
+                    const valid = nums.filter(r => !isNaN(r));
+                    const sum = valid.reduce((a, b) => a + b, 0);
+                    return valid.length ? sum / valid.length : 0;
+                }''')
+                latest3_rating = round(avg_rating, 1)
+                logging.info(f"ASIN={asin} - Page {page_num} latest3 average rating: {latest3_rating}")
+            except Exception as e_rt:
+                logging.error(f"ASIN={asin} - Error calculating latest3_rating on page {page_num}: {e_rt}")
+
         # Update previous_first_review_text for the next iteration
         previous_first_review_text = current_page_first_review_text_for_next_iteration if current_page_first_review_text_for_next_iteration else previous_first_review_text
 
-    logging.info(f"ASIN={asin} - Total Vine reviews found: {vine_count}")
-    return vine_count
+    logging.info(f"ASIN={asin} - Total Vine reviews found: {vine_count}, latest3_rating: {latest3_rating}")
+    return vine_count, latest3_rating
 
 # 新增：Vine 评论独立抓取函数，使用登录会话
 async def run_vine_scraper(df, results_list_ref, concurrency, user_data_dir):
@@ -303,7 +322,7 @@ async def run_vine_scraper(df, results_list_ref, concurrency, user_data_dir):
         # 使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
         context = await pw.chromium.launch_persistent_context(
             user_data_dir,
-            headless=False,
+            headless=True,
             executable_path=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             user_agent=DEFAULT_USER_AGENT,
             locale='en-US',
@@ -311,15 +330,23 @@ async def run_vine_scraper(df, results_list_ref, concurrency, user_data_dir):
             viewport={'width': 1920, 'height': 1080}
         )
         page = await context.new_page()
+        # 初始化 Vine 评论抓取的进度条
+        pbar = tqdm(total=len(df), desc='Vine Scraping')
         await page.set_extra_http_headers({"User-Agent": DEFAULT_USER_AGENT})
         # 登录状态已持久化，直接开始抓取 Vine 评论
         for idx, row in enumerate(df.itertuples(index=False)):
             asin = getattr(row, 'ASIN', '')
             country = getattr(row, 'country', '').upper()
             domain = DOMAIN_MAP.get(country, 'amazon.com')
-            count = await fetch_vine_count(page, asin, domain)
-            results_list_ref[idx]['vine_count'] = count
-            logging.info(f"ASIN={asin} - Vine count updated: {count}")
+            # 获取 Vine 评论总数和最后一页前三条评论平均评分
+            vine_count, latest3_rating = await fetch_vine_count(page, asin, domain)
+            results_list_ref[idx]['vine_count'] = vine_count
+            results_list_ref[idx]['latest3_rating'] = latest3_rating
+            logging.info(f"ASIN={asin} - Vine count updated: {vine_count}, latest3_rating: {latest3_rating}")
+            # 更新进度条
+            pbar.update(1)
+        # 完成后关闭进度条并关闭浏览器
+        pbar.close()
         await context.close()
 
 # 新增：登录流程，通过任意VINE链接触发登录
