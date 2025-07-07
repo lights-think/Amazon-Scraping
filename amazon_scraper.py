@@ -692,6 +692,19 @@ async def fetch_product_data(page, url):
     # 最终日志记录
     logging.info(f"ASIN from URL {url} - Final parsed data: BSR={main_rank}/{main_category}, Sub={sub_rank}/{sub_category}, Rating={rating}, Reviews={review_count}")
 
+    # --- 新增：主子类排名对比，数字大的为父类 ---
+    # 只要主类和子类排名都存在且为数字
+    try:
+        main_rank_num = int(str(main_rank).replace(',', '')) if main_rank and str(main_rank).isdigit() else None
+        sub_rank_num = int(str(sub_rank).replace(',', '')) if sub_rank and str(sub_rank).isdigit() else None
+        if main_rank_num is not None and sub_rank_num is not None:
+            if main_rank_num < sub_rank_num:
+                # 交换，数字大的为父类
+                main_category, sub_category = sub_category, main_category
+                main_rank, sub_rank = sub_rank, main_rank
+    except Exception as e:
+        logging.warning(f"BSR父子类排名对比异常: {e}")
+
     return main_category, main_rank, sub_category, sub_rank, rating, review_count
 
 async def fetch_vine_count(page, asin, domain):
@@ -1064,6 +1077,50 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir):
             await p_item.close()
         await context.close()
 
+def clean_category_name(name):
+    """
+    去除品类名称中的特殊字符，仅保留中英文、数字和空格。
+    """
+    if pd.isna(name):
+        return name
+    # 保留中文、英文、数字和空格
+    return re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9 ]', '', str(name))
+
+def clean_and_adjust_categories(csv_path='output.csv'):
+    """
+    读取csv，清洗品类名称，调整父子类关系，覆盖写回。
+    """
+    df = pd.read_csv(csv_path, dtype=str)
+    # 清洗品类名称
+    df['bsr_main_category'] = df['bsr_main_category'].apply(clean_category_name)
+    df['bsr_sub_category'] = df['bsr_sub_category'].apply(clean_category_name)
+
+    # 父子类调整
+    def adjust_row(row):
+        # 检查主类/子类及排名是否缺失
+        main_cat, sub_cat = row['bsr_main_category'], row['bsr_sub_category']
+        main_rank, sub_rank = row['bsr_main_rank'], row['bsr_sub_rank']
+        # 只要有一个排名缺失，跳过调整
+        if (pd.isna(main_cat) or pd.isna(sub_cat) or
+            pd.isna(main_rank) or pd.isna(sub_rank) or
+            main_cat == '' or sub_cat == '' or
+            main_rank == '' or sub_rank == ''):
+            return row
+        try:
+            main_rank_num = int(str(main_rank).replace(',', ''))
+            sub_rank_num = int(str(sub_rank).replace(',', ''))
+        except Exception:
+            return row
+        # 如果主类排名大于子类排名，则交换
+        if main_rank_num > sub_rank_num:
+            row['bsr_main_category'], row['bsr_sub_category'] = sub_cat, main_cat
+            row['bsr_main_rank'], row['bsr_sub_rank'] = sub_rank, main_rank
+        return row
+
+    df = df.apply(adjust_row, axis=1)
+    # 覆盖写回
+    df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+
 @click.command()
 @click.option('--input', '-i', 'input_file', default='data/test_input.csv', help='输入CSV/Excel文件路径，包含ASIN和country列')
 @click.option('--encoding', '-e', 'encoding', default='utf-8-sig', help='输入CSV文件编码 (例如 utf-8, utf-8-sig, gbk)')
@@ -1151,6 +1208,9 @@ def main(input_file, output_file, encoding, sep, concurrency, profile_dir):
     except Exception as e_final:
         print(f"错误: 无法保存完整结果到 '{abs_final_path}': {e_final}")
         logging.error(f"无法保存完整结果到 '{abs_final_path}': {e_final}")
+
+    # --- 新增：主流程后自动清洗和调整品类 ---
+    clean_and_adjust_categories('output.csv')
 
 if __name__ == '__main__':
     main()
