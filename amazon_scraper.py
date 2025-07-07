@@ -514,7 +514,7 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir):
         await context.close()
 
 @click.command()
-@click.option('--input', '-i', 'input_file', required=True, help='输入CSV/Excel文件路径，包含ASIN和country列')
+@click.option('--input', '-i', 'input_file', default='data/test_input.csv', help='输入CSV/Excel文件路径，包含ASIN和country列')
 @click.option('--encoding', '-e', 'encoding', default='utf-8-sig', help='输入CSV文件编码 (例如 utf-8, utf-8-sig, gbk)')
 @click.option('--sep', '-s', 'sep', default=',', help='输入CSV文件分隔符 (例如 ",", "\\t", ";")')
 @click.option('--concurrency', '-c', 'concurrency', default=5, type=int, help='并发任务数 (建议根据网络和机器性能调整，过高易被封)')
