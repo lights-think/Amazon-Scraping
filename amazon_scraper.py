@@ -8,6 +8,7 @@ import logging
 import random
 import os
 import json
+import time
 
 # 日志配置：仅写入文件 spider.log
 logger = logging.getLogger()
@@ -174,6 +175,8 @@ async def fetch_product_data(page, url):
     
     try:
         await page.goto(url, timeout=60000, wait_until='domcontentloaded')
+        # 新增：检测并处理"继续购物"确认页面
+        await handle_continue_shopping(page)
     except Exception as e:
         logging.error(f"Error navigating to {url}: {e}") # 使用 logging
         return '', '', '', '', '', '' # 返回空值以便重试逻辑判断
@@ -1120,6 +1123,62 @@ def clean_and_adjust_categories(csv_path='output.csv'):
     df = df.apply(adjust_row, axis=1)
     # 覆盖写回
     df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+
+async def handle_continue_shopping(page):
+    """
+    检测并自动点击亚马逊多语言"继续购物"确认页面的按钮，规避反爬虫。
+    """
+    import random
+    import logging
+    try:
+        # 1. 结构+属性联合定位
+        buttons = await page.query_selector_all('button[type="submit"].a-button-text')
+        for btn in buttons:
+            visible = await btn.is_visible()
+            enabled = await btn.is_enabled()
+            # 检查父级div是否有提示信息或info图标
+            parent = await btn.evaluate_handle('node => node.parentElement')
+            parent_html = await parent.evaluate('node => node.outerHTML') if parent else ''
+            # 只要按钮可见可用，且父级结构有info或提示框特征
+            if visible and enabled and (('a-box-info' in parent_html) or ('a-icon-alert' in parent_html) or ('info' in parent_html)):
+                await asyncio.sleep(random.uniform(0.8, 1.5))
+                await btn.hover()
+                await asyncio.sleep(random.uniform(0.2, 0.6))
+                await btn.click()
+                logging.info('[CONTINUE_SHOPPING] Clicked button via structure+parent check')
+                await page.wait_for_timeout(1200)
+                return True
+        # 2. 兜底：查找所有可见的type=submit按钮
+        all_submit_btns = await page.query_selector_all('button[type="submit"]')
+        for btn in all_submit_btns:
+            visible = await btn.is_visible()
+            enabled = await btn.is_enabled()
+            if visible and enabled:
+                await asyncio.sleep(random.uniform(0.8, 1.5))
+                await btn.hover()
+                await asyncio.sleep(random.uniform(0.2, 0.6))
+                await btn.click()
+                logging.info('[CONTINUE_SHOPPING] Clicked fallback submit button')
+                await page.wait_for_timeout(1200)
+                return True
+        # 3. 兜底：XPath查找所有可见的按钮
+        xpath_btns = await page.query_selector_all('//button[@type="submit"]')
+        for btn in xpath_btns:
+            visible = await btn.is_visible()
+            enabled = await btn.is_enabled()
+            if visible and enabled:
+                await asyncio.sleep(random.uniform(0.8, 1.5))
+                await btn.hover()
+                await asyncio.sleep(random.uniform(0.2, 0.6))
+                await btn.click()
+                logging.info('[CONTINUE_SHOPPING] Clicked fallback XPath button')
+                await page.wait_for_timeout(1200)
+                return True
+        logging.info('[CONTINUE_SHOPPING] No continue button found')
+        return False
+    except Exception as e:
+        logging.error(f'[CONTINUE_SHOPPING] Exception: {e}')
+        return False
 
 @click.command()
 @click.option('--input', '-i', 'input_file', default='data/test_input.csv', help='输入CSV/Excel文件路径，包含ASIN和country列')
