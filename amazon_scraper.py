@@ -31,14 +31,147 @@ DOMAIN_MAP = {
     'CA': 'amazon.ca',
     'JP': 'amazon.co.jp',
     'MX': 'amazon.com.mx',
-    'IN': 'amazon.in'
+    'IN': 'amazon.in',
+    'NL': 'amazon.nl',
+    'SE': 'amazon.se',
+    'BE': 'amazon.com.be',
+    'IE': 'amazon.ie',
+    'AU': 'amazon.com.au',
+    'BR': 'amazon.com.br',
+    'SG': 'amazon.sg'
+}
+
+# 国家语言环境映射
+LOCALE_MAP = {
+    'US': 'en-US',
+    'UK': 'en-GB', 
+    'DE': 'de-DE',
+    'FR': 'fr-FR',
+    'ES': 'es-ES',
+    'IT': 'it-IT',
+    'CA': 'en-CA',
+    'JP': 'ja-JP',
+    'MX': 'es-MX',
+    'IN': 'en-IN',
+    'NL': 'nl-NL',
+    'SE': 'sv-SE',
+    'BE': 'nl-BE',
+    'IE': 'en-IE',
+    'AU': 'en-AU',
+    'BR': 'pt-BR',
+    'SG': 'en-SG'
+}
+
+# 国家时区映射
+TIMEZONE_MAP = {
+    'US': 'America/New_York',
+    'UK': 'Europe/London',
+    'DE': 'Europe/Berlin', 
+    'FR': 'Europe/Paris',
+    'ES': 'Europe/Madrid',
+    'IT': 'Europe/Rome',
+    'CA': 'America/Toronto',
+    'JP': 'Asia/Tokyo',
+    'MX': 'America/Mexico_City',
+    'IN': 'Asia/Kolkata',
+    'NL': 'Europe/Amsterdam',
+    'SE': 'Europe/Stockholm',
+    'BE': 'Europe/Brussels',
+    'IE': 'Europe/Dublin',
+    'AU': 'Australia/Sydney',
+    'BR': 'America/Sao_Paulo',
+    'SG': 'Asia/Singapore'
 }
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.114 Safari/537.36"
 
+# === 新增：递归提取BSR主类与所有子类的通用函数 ===
+async def extract_bsr_from_node(node):
+    """
+    递归遍历ul/li结构，提取所有li文本中的BSR排名和类别，兼容多语言。
+    返回列表[(rank, category), ...]
+    优先英文正则（in），未命中再尝试其他语言正则。
+    """
+    results = []
+    patterns_en = [
+        r'(?:#|No\.)?\s*([0-9]+(?:,[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)'
+    ]
+    patterns_other = [
+        r'#([0-9]+(?:\s+[0-9]{3})*)\s+i\s+([^(#]+?)(?:\s*\(|$)',  # 瑞典
+        r'#([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',  # 荷兰/英文
+        r'(?:nº|n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+en\s+([^(#]+?)(?:\s*\(|$)',  # 西班牙
+        r'(?:n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+dans\s+([^(#]+?)(?:\s*\(|$)',  # 法语
+        r'(?:Nr\.|Rang\s+Nr\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+(?:in|bei)\s+([^(#]+?)(?:\s*\(|$)',  # 德语
+        r'n\.\s*([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',  # 意大利
+        r'([0-9]+(?:,[0-9]{3})*)位([^0-9（\(]+?)(?:\s*（|\s*\(|$)',  # 日语
+        r'(?:排第|排名第)([0-9,，]+)名\s*([^排名（]+?)(?:\s*（|$)'  # 中文
+    ]
+    li_nodes = await node.query_selector_all(':scope > li')
+    if li_nodes:
+        for li in li_nodes:
+            sub_ul = await li.query_selector('ul')
+            if sub_ul:
+                results.extend(await extract_bsr_from_node(sub_ul))
+            span = await li.query_selector('span')
+            if span:
+                text = await span.inner_text()
+            else:
+                a = await li.query_selector('a')
+                if a:
+                    text = await a.inner_text()
+                else:
+                    text = await li.inner_text()
+            text = re.sub(r'\s+', ' ', text).strip()
+            found = False
+            # 优先英文正则
+            for pattern in patterns_en:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                for m in matches:
+                    rank_str = m[0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
+                    cat = m[1].strip().rstrip(')）')
+                    if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                        results.append((rank_str, cat))
+                        found = True
+            # 只要英文正则没命中，再尝试其他语言
+            if not found:
+                for pattern in patterns_other:
+                    matches = re.findall(pattern, text, re.IGNORECASE)
+                    for m in matches:
+                        rank_str = m[0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
+                        cat = m[1].strip().rstrip(')）')
+                        if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                            results.append((rank_str, cat))
+            logging.info(f"[BSR-LI] li_text='{text}' matches={results}")
+    else:
+        text = await node.inner_text()
+        text = re.sub(r'\s+', ' ', text).strip()
+        found = False
+        for pattern in patterns_en:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for m in matches:
+                rank_str = m[0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
+                cat = m[1].strip().rstrip(')）')
+                if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                    results.append((rank_str, cat))
+                    found = True
+        if not found:
+            for pattern in patterns_other:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                for m in matches:
+                    rank_str = m[0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
+                    cat = m[1].strip().rstrip(')）')
+                    if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                        results.append((rank_str, cat))
+        logging.info(f"[BSR-NON-LI] text='{text}' matches={results}")
+    return results
+
 async def fetch_product_data(page, url):
     # 随机延时，模拟人类访问
     await asyncio.sleep(random.uniform(0.8, 1.5)) # 稍微增加延时
+    
+    # 不强制添加语言参数，让Amazon根据地区自然显示
+    # 我们依赖精确的多语言BSR解析策略来处理各种格式
+    
     try:
         await page.goto(url, timeout=60000, wait_until='domcontentloaded')
     except Exception as e:
@@ -59,135 +192,493 @@ async def fetch_product_data(page, url):
         logging.debug(f"ASIN from URL {url} - Error or no expander for BSR: {e}") # 使用 debug 级别
         pass
 
-    # 默认值
-    main_category = ''
+    # 固定等待 2 秒，再进行 BSR 解析；如果第一次失败，再等待 2 秒重试一次
+    await page.wait_for_timeout(2000)
+
+    # === 基于真实格式的精确多语言BSR解析策略 V2 ===
+    # 瑞典格式: "#49 449 i Bygg" (空格分隔千位)
+    # 荷兰格式: "#4.328 in Kantoorproducten" (句号分隔千位)  
+    # 西班牙格式: "nº20.691 en Productos" (句号分隔千位)
+    # 日本格式: "4,312位ペット用品"
+    # 意大利格式: "n. 2.477 in Cancelleria"
+    
     main_rank = ''
-    sub_category = ''
+    main_category = ''
     sub_rank = ''
-
-    # BSR解析：先通过表头文本定位 Best Sellers Rank，再解析大类/小类及排名
+    sub_category = ''
+    
+    # 策略1: 优先查找标准BSR表格结构
     try:
-        bsr_td = await page.query_selector('xpath=//th[contains(normalize-space(text()),"Best Sellers Rank")]/following-sibling::td | //th[contains(normalize-space(text()),"Best Sellers Rank")]/../td') # 兼容不同层级
-        if bsr_td:
-            td_text = await bsr_td.inner_text()
-            lines = [line.strip() for line in td_text.splitlines() if line.strip()]
-            if len(lines) >= 1:
-                m = re.match(r'#([\d,]+) in (.+?)(?: \(|$)', lines[0])
-                if m:
-                    main_rank = m.group(1).replace(',', '')
-                    main_category = m.group(2).strip()
-            if len(lines) >= 2:
-                m2 = re.match(r'#([\d,]+) in (.+)', lines[1])
-                if m2:
-                    sub_rank = m2.group(1).replace(',', '')
-                    sub_category = m2.group(2).strip()
-        else: # 回退到旧选择器或更通用的列表项查找
-            logging.debug(f"ASIN from URL {url} - BSR table cell not found via th, trying list item fallback.")
-            # BSR 备用解析：通用 li 匹配 Best Sellers Rank 并文本规范化 (移到这里作为主要回退)
-            fb_elem = await page.query_selector(
-                'xpath=//li[contains(normalize-space(.),"Best Sellers Rank")] | //div[contains(normalize-space(.),"Best Sellers Rank") and contains(@id, "detailBullets")]//li[contains(normalize-space(.),"#")]'
-            )
-            if fb_elem:
-                fb_text = await fb_elem.inner_text()
-                fb_text = re.sub(r'\s+', ' ', fb_text)
-                matches = re.findall(r'#([\d,]+) in ([^#\(]+?)(?:\s*\(See Top 100|\s*$)', fb_text) # 改进正则，避免捕获 "See Top 100"
+        bsr_table_rows = await page.query_selector_all('xpath=//tr[.//th[contains(text(),"Best Sellers Rank") or contains(text(),"Amazon Best Sellers Rank") or contains(text(),"Sales Rank") or contains(text(),"Rangordning för bästsäljare") or contains(text(),"Plaats in bestsellerlijst") or contains(text(),"Clasificación en los más vendidos") or contains(text(),"Classement des meilleures ventes") or contains(text(),"Bestseller-Rang") or contains(text(),"Posizione nella classifica")]]')
+        for row in bsr_table_rows:
+            td_content = await row.query_selector('td')
+            if td_content:
+                # 优先查找ul/li结构
+                ul_node = await td_content.query_selector('ul')
+                if ul_node:
+                    bsr_list = await extract_bsr_from_node(ul_node)
+                    main_rank, main_category, sub_rank, sub_category = '', '', '', ''
+                    main_idx = -1
+                    # 1. 优先li文本含'Top 100'或'See Top 100'为主类
+                    li_texts = []
+                    li_nodes = await ul_node.query_selector_all(':scope > li')
+                    for li in li_nodes:
+                        text = ''
+                        span = await li.query_selector('span')
+                        if span:
+                            text = await span.inner_text()
+                        else:
+                            a = await li.query_selector('a')
+                            if a:
+                                text = await a.inner_text()
+                            else:
+                                text = await li.inner_text()
+                        text = re.sub(r'\s+', ' ', text).strip()
+                        li_texts.append(text)
+                    # 匹配li_texts和bsr_list顺序
+                    for i, text in enumerate(li_texts):
+                        if 'Top 100' in text or 'See Top 100' in text:
+                            main_idx = i
+                            break
+                    reason = ''
+                    if main_idx >= 0 and main_idx < len(bsr_list):
+                        main_rank, main_category = bsr_list[main_idx]
+                        reason = '主类通过Top 100语义判别'
+                    elif bsr_list:
+                        # 2. 无Top 100则排名最大为主类
+                        ranks = [(i, int(r[0])) for i, r in enumerate(bsr_list) if r[0].isdigit()]
+                        if ranks:
+                            main_idx = max(ranks, key=lambda x: x[1])[0]
+                            main_rank, main_category = bsr_list[main_idx]
+                            reason = '主类通过排名最大判别'
+                    # 3. 子类为其余项中排名最小且与主类不同的项
+                    sub_idx = -1
+                    if main_idx >= 0 and len(bsr_list) > 1:
+                        sub_candidates = [(i, int(r[0])) for i, r in enumerate(bsr_list) if i != main_idx and r[0].isdigit() and r[1] and (r[0] != main_rank or r[1] != main_category)]
+                        if sub_candidates:
+                            sub_idx = min(sub_candidates, key=lambda x: x[1])[0]
+                            sub_rank, sub_category = bsr_list[sub_idx]
+                    logging.info(f"[BSR分配] li_texts={li_texts} bsr_list={bsr_list} main=({main_rank},{main_category}) sub=({sub_rank},{sub_category}) 判别理由={reason}")
+                    break
+                # 否则按原有正则处理
+                text = await td_content.inner_text()
+                text = re.sub(r'\s+', ' ', text).strip()
+                patterns = [
+                    r'#([0-9]+(?:\s+[0-9]{3})*)\s+i\s+([^(#]+?)(?:\s*\(|$)',
+                    r'#([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',
+                    r'(?:nº|n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+en\s+([^(#]+?)(?:\s*\(|$)',
+                    r'(?:n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+dans\s+([^(#]+?)(?:\s*\(|$)',
+                    r'(?:Nr\.|Rang\s+Nr\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+(?:in|bei)\s+([^(#]+?)(?:\s*\(|$)',
+                    r'n\.\s*([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',
+                    r'([0-9]+(?:,[0-9]{3})*)位([^0-9（\(]+?)(?:\s*（|\s*\(|$)',
+                    r'(?:#|No\.)\s*([0-9]+(?:,[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',
+                    r'(?:排第|排名第)([0-9,，]+)名\s*([^排名（]+?)(?:\s*（|$)'
+                ]
+                for pattern in patterns:
+                    matches = re.findall(pattern, text, re.IGNORECASE)
                 if matches:
-                    if not main_rank and len(matches) > 0: # 仅当主BSR未找到时填充
-                        main_rank = matches[0][0].replace(',', '')
-                        main_category = matches[0][1].strip().rstrip('.')
-                    if not sub_rank and len(matches) > 1: # 仅当子BSR未找到时填充
-                        sub_rank = matches[1][0].replace(',', '')
-                        sub_category = matches[1][1].strip().rstrip('.')
+                        rank_str = matches[0][0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
+                        if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                            main_rank = rank_str
+                            main_category = matches[0][1].strip()
+                            if len(matches) > 1:
+                                sub_rank_str = matches[1][0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
+                                if sub_rank_str.isdigit() and 1 <= int(sub_rank_str) <= 10000000:
+                                    sub_rank = sub_rank_str
+                                    sub_category = matches[1][1].strip()
+                            logging.info(f"ASIN from URL {url} - BSR parsed via Strategy 1 (Table): main={main_rank}/{main_category}, sub={sub_rank}/{sub_category}")
+                            break
+                if main_rank:
+                    break
     except Exception as e:
-        logging.warning(f"ASIN from URL {url} - Error parsing BSR: {e}")
-        pass
+        logging.warning(f"Strategy 1 (Table) error: {e}")
 
+    # === 新增：ul/li结构通用处理，兼容IE/EN/FR等 ===
+    if not main_rank:
+        try:
+            # 直接查找所有ul/li结构（如IE/EN/FR等）
+            ul_nodes = await page.query_selector_all('ul')
+            for ul_node in ul_nodes:
+                bsr_list = await extract_bsr_from_node(ul_node)
+                if bsr_list:
+                    main_rank, main_category = bsr_list[0]
+                    if len(bsr_list) > 1:
+                        sub_rank, sub_category = bsr_list[1]
+                    else:
+                        sub_rank, sub_category = '', ''
+                    logging.info(f"ASIN from URL {url} - BSR parsed via UL structure: {bsr_list}")
+                    break
+        except Exception as e:
+            logging.warning(f"UL structure BSR extraction error: {e}")
+
+    # 策略2: 日语格式专门处理 (X位Category)
+    if not main_rank:
+        try:
+            jp_elements = await page.query_selector_all('xpath=//tr[contains(.,"売れ筋ランキング") or contains(.,"位")] | //li[contains(.,"売れ筋ランキング") or contains(.,"位")] | //td[contains(.,"売れ筋ランキング") or contains(.,"位")] | //div[contains(.,"売れ筋ランキング") or contains(.,"位")]')
+            for element in jp_elements:
+                text = await element.inner_text()
+                text = re.sub(r'\s+', ' ', text).strip()
+                
+                # 日语格式: 4,312位ペット用品 或 15位水槽用エアポンプアクセサリ
+                jp_matches = re.findall(r'([0-9,，]+)位([^0-9（\(]+?)(?:\s*（|\s*\(|$)', text)
+                if jp_matches and not main_rank:
+                    main_rank = jp_matches[0][0].replace(',', '').replace('，', '')
+                    main_category = jp_matches[0][1].strip()
+                    if len(jp_matches) > 1:
+                        sub_rank = jp_matches[1][0].replace(',', '').replace('，', '')
+                        sub_category = jp_matches[1][1].strip()
+                    logging.info(f"ASIN from URL {url} - BSR parsed via Strategy 2 (JP): main={main_rank}/{main_category}, sub={sub_rank}/{sub_category}")
+                    break
+        except Exception as e:
+            logging.warning(f"Strategy 2 (JP) error: {e}")
+
+    # 策略3: 意大利语格式专门处理 (n. X in Category)
+    if not main_rank:
+        try:
+            it_elements = await page.query_selector_all('xpath=//tr[contains(.,"Posizione") or contains(.,"classifica") or contains(.,"Bestseller")] | //li[contains(.,"Posizione") or contains(.,"classifica") or contains(.,"Bestseller")] | //td[contains(.,"Posizione") or contains(.,"classifica") or contains(.,"Bestseller")] | //div[contains(.,"Posizione") or contains(.,"classifica") or contains(.,"Bestseller")]')
+            for element in it_elements:
+                text = await element.inner_text()
+                text = re.sub(r'\s+', ' ', text).strip()
+                
+                # 意大利语格式: n. 2.477 in Cancelleria 或 n. 53 in Porta badge
+                it_matches = re.findall(r'n\.\s*([0-9.,]+)\s+in\s+([^(0-9]+?)(?:\s*\(|$)', text, re.IGNORECASE)
+                if it_matches and not main_rank:
+                    main_rank = it_matches[0][0].replace('.', '').replace(',', '')
+                    main_category = it_matches[0][1].strip()
+                    if len(it_matches) > 1:
+                        sub_rank = it_matches[1][0].replace('.', '').replace(',', '')
+                        sub_category = it_matches[1][1].strip()
+                    logging.info(f"ASIN from URL {url} - BSR parsed via Strategy 3 (IT): main={main_rank}/{main_category}, sub={sub_rank}/{sub_category}")
+                    break
+        except Exception as e:
+            logging.warning(f"Strategy 3 (IT) error: {e}")
+
+    # 策略4: 瑞典格式专门处理 (#X X i Category)  
+    if not main_rank:
+        try:
+            se_elements = await page.query_selector_all('xpath=//tr[contains(.,"Rangordning") or contains(.,"bästsäljare")] | //li[contains(.,"Rangordning") or contains(.,"bästsäljare")] | //td[contains(.,"Rangordning") or contains(.,"bästsäljare")] | //div[contains(.,"Rangordning") or contains(.,"bästsäljare")]')
+            for element in se_elements:
+                text = await element.inner_text()
+                text = re.sub(r'\s+', ' ', text).strip()
+                
+                # 瑞典格式: #49 449 i Bygg (空格分隔千位)
+                se_matches = re.findall(r'#([0-9]+(?:\s+[0-9]{3})*)\s+i\s+([^(#]+?)(?:\s*\(|$)', text, re.IGNORECASE)
+                if se_matches and not main_rank:
+                    main_rank = se_matches[0][0].replace(' ', '')
+                    main_category = se_matches[0][1].strip()
+                    if len(se_matches) > 1:
+                        sub_rank = se_matches[1][0].replace(' ', '')
+                        sub_category = se_matches[1][1].strip()
+                    logging.info(f"ASIN from URL {url} - BSR parsed via Strategy 4 (SE): main={main_rank}/{main_category}, sub={sub_rank}/{sub_category}")
+                    break
+        except Exception as e:
+            logging.warning(f"Strategy 4 (SE) error: {e}")
+
+    # 策略5: 荷兰格式专门处理 (#X.XXX in Category)
+    if not main_rank:
+        try:
+            nl_elements = await page.query_selector_all('xpath=//tr[contains(.,"Plaats") or contains(.,"bestsellerlijst")] | //li[contains(.,"Plaats") or contains(.,"bestsellerlijst")] | //td[contains(.,"Plaats") or contains(.,"bestsellerlijst")] | //div[contains(.,"Plaats") or contains(.,"bestsellerlijst")]')
+            for element in nl_elements:
+                text = await element.inner_text()
+                text = re.sub(r'\s+', ' ', text).strip()
+                
+                # 荷兰格式: #4.328 in Kantoorproducten (句号分隔千位)
+                nl_matches = re.findall(r'#([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)', text, re.IGNORECASE)
+                if nl_matches and not main_rank:
+                    main_rank = nl_matches[0][0].replace('.', '')
+                    main_category = nl_matches[0][1].strip()
+                    if len(nl_matches) > 1:
+                        sub_rank = nl_matches[1][0].replace('.', '')
+                        sub_category = nl_matches[1][1].strip()
+                    logging.info(f"ASIN from URL {url} - BSR parsed via Strategy 5 (NL): main={main_rank}/{main_category}, sub={sub_rank}/{sub_category}")
+                    break
+        except Exception as e:
+            logging.warning(f"Strategy 5 (NL) error: {e}")
+
+    # 策略6: 西班牙格式专门处理 (nºX.XXX en Category)
+    if not main_rank:
+        try:
+            es_elements = await page.query_selector_all('xpath=//tr[contains(.,"Clasificación") or contains(.,"vendidos") or contains(.,"Bestseller")] | //li[contains(.,"Clasificación") or contains(.,"vendidos") or contains(.,"Bestseller")] | //td[contains(.,"Clasificación") or contains(.,"vendidos") or contains(.,"Bestseller")] | //div[contains(.,"Clasificación") or contains(.,"vendidos") or contains(.,"Bestseller")]')
+            for element in es_elements:
+                text = await element.inner_text()
+                text = re.sub(r'\s+', ' ', text).strip()
+                
+                # 西班牙格式: nº20.691 en Productos (句号分隔千位)
+                es_matches = re.findall(r'(?:nº|n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+en\s+([^(#]+?)(?:\s*\(|$)', text, re.IGNORECASE)
+                if es_matches and not main_rank:
+                    main_rank = es_matches[0][0].replace('.', '')
+                    main_category = es_matches[0][1].strip()
+                    if len(es_matches) > 1:
+                        sub_rank = es_matches[1][0].replace('.', '')
+                        sub_category = es_matches[1][1].strip()
+                    logging.info(f"ASIN from URL {url} - BSR parsed via Strategy 6 (ES): main={main_rank}/{main_category}, sub={sub_rank}/{sub_category}")
+                    break
+        except Exception as e:
+            logging.warning(f"Strategy 6 (ES) error: {e}")
+
+    # 策略7: 法语格式专门处理 (n° X.XXX dans Category)
+    if not main_rank:
+        try:
+            fr_elements = await page.query_selector_all('xpath=//tr[contains(.,"Classement") or contains(.,"meilleures ventes")] | //li[contains(.,"Classement") or contains(.,"meilleures ventes")] | //td[contains(.,"Classement") or contains(.,"meilleures ventes")] | //div[contains(.,"Classement") or contains(.,"meilleures ventes")]')
+            for element in fr_elements:
+                text = await element.inner_text()
+                text = re.sub(r'\s+', ' ', text).strip()
+                
+                # 法语格式: n° 1.234 dans Catégorie (句号分隔千位)
+                fr_matches = re.findall(r'(?:n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+dans\s+([^(#]+?)(?:\s*\(|$)', text, re.IGNORECASE)
+                if fr_matches and not main_rank:
+                    main_rank = fr_matches[0][0].replace('.', '')
+                    main_category = fr_matches[0][1].strip()
+                    if len(fr_matches) > 1:
+                        sub_rank = fr_matches[1][0].replace('.', '')
+                        sub_category = fr_matches[1][1].strip()
+                    logging.info(f"ASIN from URL {url} - BSR parsed via Strategy 7 (FR): main={main_rank}/{main_category}, sub={sub_rank}/{sub_category}")
+                    break
+        except Exception as e:
+            logging.warning(f"Strategy 7 (FR) error: {e}")
+
+    # 策略8: 德语格式专门处理 (Nr. X.XXX in Category)
+    if not main_rank:
+        try:
+            de_elements = await page.query_selector_all('xpath=//tr[contains(.,"Bestseller-Rang") or contains(.,"Verkaufsrang")] | //li[contains(.,"Bestseller-Rang") or contains(.,"Verkaufsrang")] | //td[contains(.,"Bestseller-Rang") or contains(.,"Verkaufsrang")] | //div[contains(.,"Bestseller-Rang") or contains(.,"Verkaufsrang")]')
+            for element in de_elements:
+                text = await element.inner_text()
+                text = re.sub(r'\s+', ' ', text).strip()
+                
+                # 德语格式: Nr. 1.234 in Kategorie (句号分隔千位)
+                de_matches = re.findall(r'(?:Nr\.|Rang\s+Nr\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+(?:in|bei)\s+([^(#]+?)(?:\s*\(|$)', text, re.IGNORECASE)
+                if de_matches and not main_rank:
+                    main_rank = de_matches[0][0].replace('.', '')
+                    main_category = de_matches[0][1].strip()
+                    if len(de_matches) > 1:
+                        sub_rank = de_matches[1][0].replace('.', '')
+                        sub_category = de_matches[1][1].strip()
+                    logging.info(f"ASIN from URL {url} - BSR parsed via Strategy 8 (DE): main={main_rank}/{main_category}, sub={sub_rank}/{sub_category}")
+                    break
+        except Exception as e:
+            logging.warning(f"Strategy 8 (DE) error: {e}")
+
+    # 策略9: 标准英文格式 (#1,234 in Category)
+    if not main_rank:
+        try:
+            en_elements = await page.query_selector_all('xpath=//tr[contains(.,"Best Sellers Rank") or contains(.,"Amazon Best Sellers Rank") or contains(.,"Sales Rank")] | //li[contains(.,"Best Sellers Rank") or contains(.,"Amazon Best Sellers Rank") or contains(.,"Sales Rank")] | //td[contains(.,"Best Sellers Rank") or contains(.,"Amazon Best Sellers Rank") or contains(.,"Sales Rank")] | //div[contains(.,"Best Sellers Rank") or contains(.,"Amazon Best Sellers Rank") or contains(.,"Sales Rank")]')
+            for element in en_elements:
+                text = await element.inner_text()
+                text = re.sub(r'\s+', ' ', text).strip()
+                
+                # 英文格式: #1,234 in Category or No. 1,234 in Category
+                en_matches = re.findall(r'(?:#|No\.)\s*([0-9,，]+)\s+in\s+([^(#]+?)(?:\s*\(|$)', text, re.IGNORECASE)
+                if en_matches and not main_rank:
+                    main_rank = en_matches[0][0].replace(',', '').replace('，', '')
+                    main_category = en_matches[0][1].strip()
+                    if len(en_matches) > 1:
+                        sub_rank = en_matches[1][0].replace(',', '').replace('，', '')
+                        sub_category = en_matches[1][1].strip()
+                    logging.info(f"ASIN from URL {url} - BSR parsed via Strategy 9 (EN): main={main_rank}/{main_category}, sub={sub_rank}/{sub_category}")
+                    break
+        except Exception as e:
+            logging.warning(f"Strategy 9 (EN) error: {e}")
+
+    # 策略10: 通用兜底 - 基于用户提供的CSS选择器
+    if not main_rank:
+        try:
+            # 使用用户提供的具体CSS选择器
+            specific_selectors = [
+                '#productDetailsVoyagerAccordion_feature_div table tbody tr',
+                '.prodDetSectionEntry',
+                '[class*="prodDet"]'
+            ]
+            
+            for selector in specific_selectors:
+                elements = await page.query_selector_all(selector)
+                for element in elements:
+                    text = await element.inner_text()
+                    if 'Best Sellers' in text or 'Rangordning' in text or 'Plaats' in text or 'Clasificación' in text:
+                        text = re.sub(r'\s+', ' ', text).strip()
+                        
+                        # 超宽松的通用模式
+                        universal_patterns = [
+                            r'#([0-9]+(?:\s+[0-9]{3})*)\s+i\s+([^(#]+?)(?:\s*\(|$)',  # 瑞典空格格式
+                            r'#([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',  # 荷兰句号格式
+                            r'(?:nº|n°|Nr\.|No\.)\s*([0-9]+(?:[\s.,][0-9]{3})*)\s+(?:en|in|dans|bei)\s+([^(#]+?)(?:\s*\(|$)',  # 多语言通用
+                            r'([0-9,，.]+)位([^0-9（\(]+?)(?:\s*（|\s*\(|$)',  # 日语位格式
+                            r'(?:^|[^0-9])([0-9]{1,7}(?:[,.，\s][0-9]{3})*)\s*(?:in|dans|en|bei|位|名|i)\s+([^0-9(]{3,}?)(?:\s*\(|[0-9]|$)'  # 最宽松匹配
+                        ]
+                        
+                        for pattern in universal_patterns:
+                            matches = re.findall(pattern, text, re.IGNORECASE)
+                            if matches:
+                                rank_str = matches[0][0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
+                                if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                                    main_rank = rank_str
+                                    main_category = matches[0][1].strip()
+                                    logging.info(f"ASIN from URL {url} - BSR parsed via Strategy 10 (Universal CSS): main={main_rank}/{main_category}")
+                                    break
+                        
+                        if main_rank:
+                            break
+                
+                if main_rank:
+                    break
+        except Exception as e:
+            logging.warning(f"Strategy 10 error: {e}")
+
+    # 重试机制：如果仍未找到BSR，等待2秒后重试最宽松匹配
+    if not main_rank:
+        await page.wait_for_timeout(2000)
+        try:
+            logging.info(f"Retrying BSR extraction for {url}")
+            retry_elements = await page.query_selector_all('xpath=//*[contains(text(),"#") or contains(text(),"No.") or contains(text(),"Nr.") or contains(text(),"n°") or contains(text(),"nº") or contains(text(),"位") or contains(text(),"排")]')
+            
+            for element in retry_elements:
+                text = await element.inner_text()
+                text = re.sub(r'\s+', ' ', text).strip()
+                
+                # 最终兜底的极宽松匹配
+                final_patterns = [
+                    r'#([0-9]+(?:\s+[0-9]{3})*)\s+i\s+([^0-9(]{2,}?)(?:\s*\(|$)',  # 瑞典空格
+                    r'#([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^0-9(]{3,}?)(?:\s*\(|$)',  # 荷兰句号
+                    r'(?:nº|n°|Nr\.|No\.)\s*([0-9]+(?:[\s.,][0-9]{3})*)\s+(?:en|in|dans|bei)\s+([^0-9(]{3,}?)(?:\s*\(|$)',  # 欧洲通用
+                    r'([0-9,，.]+)位([^0-9（\(]{2,}?)(?:\s*（|\s*\(|$)',  # 日语位
+                    r'(?:^|[^0-9])([0-9]{1,7}(?:[,.\s][0-9]{3})*)\s*(?:in|i|en|dans|bei|位|名)\s+([^0-9(]{2,}?)(?:\s*\(|[0-9]|$)'  # 超宽松
+                ]
+                
+                for pattern in final_patterns:
+                    loose_matches = re.findall(pattern, text, re.IGNORECASE)
+                    if loose_matches:
+                        rank_str = loose_matches[0][0].replace(',', '').replace('，', '').replace('.', '').replace(' ', '')
+                        if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                            main_rank = rank_str
+                            main_category = loose_matches[0][1].strip()
+                            logging.info(f"ASIN from URL {url} - BSR parsed via Retry (Final): main={main_rank}/{main_category}")
+                            break
+                
+                if main_rank:
+                    break
+        except Exception as e:
+            logging.warning(f"Retry BSR extraction error: {e}")
+
+    # === 多语言评分解析策略 ===
     # 评分和评论数解析
     rating = ''
     review_count = ''
 
-    try:
-        review_elem = await page.query_selector('#acrCustomerReviewText')
-        if review_elem:
-            review_text_raw = (await review_elem.inner_text()).strip()
-            # 提取数字部分，例如 "1,234 ratings" -> "1234"
-            m_rev = re.search(r'([\d,]+)', review_text_raw)
-            if m_rev:
-                review_count = m_rev.group(1).replace(',', '')
-    except Exception as e:
-        logging.debug(f"ASIN from URL {url} - Error parsing review count from #acrCustomerReviewText: {e}")
-        pass
+    # 多重兜底评分解析策略
+    rating_strategies = [
+        # 策略1: 标准popover
+        {
+            'name': 'standard_popover',
+            'selector': '#acrPopover',
+            'attr': 'title',
+            'pattern': r'(\d+(?:[.,]\d+)?) (?:out of 5|颗星)'
+        },
+        # 策略2: 小尺寸评分 (用户提供的新格式)
+        {
+            'name': 'small_rating',
+            'selector': '.a-size-small.a-color-base',
+            'attr': 'text',
+            'pattern': r'^(\d+(?:[.,]\d+)?)$'
+        },
+        # 策略3: popover链接中的评分
+        {
+            'name': 'popover_link',
+            'selector': '.a-popover-trigger .a-size-base.a-color-base, .a-popover-trigger .a-size-small.a-color-base',
+            'attr': 'text',
+            'pattern': r'^(\d+(?:[.,]\d+)?)$'
+        },
+        # 策略4: 图标alt文本
+        {
+            'name': 'icon_alt',
+            'selector': 'i.a-icon-alt, i[class*="a-star"] span.a-icon-alt',
+            'attr': 'text',
+            'pattern': r'(\d+(?:[.,]\d+)?) (?:out of 5|颗星)'
+        },
+        # 策略5: Customer Reviews表格
+        {
+            'name': 'customer_reviews_table',
+            'selector': 'xpath=//th[contains(normalize-space(text()),"Customer Reviews") or contains(normalize-space(text()),"推荐度")]/../td',
+            'attr': 'text',
+            'pattern': r'(\d+(?:[.,]\d+)?) (?:out of 5|颗星)'
+        },
+        # 策略6: averageCustomerReviews区域
+        {
+            'name': 'avg_customer_reviews',
+            'selector': '#averageCustomerReviews',
+            'attr': 'text',
+            'pattern': r'(\d+(?:[.,]\d+)?) (?:out of 5|颗星)'
+        }
+    ]
 
-    try:
-        popover = await page.query_selector('#acrPopover')
-        if popover:
-            title = await popover.get_attribute('title')
-            if title:
-                m = re.search(r'(\d+(?:[.,]\d+)?) out of 5', title.replace(',', '.')) # 兼容小数点和逗号
-                if m:
-                    rating = m.group(1)
-    except Exception as e:
-        logging.debug(f"ASIN from URL {url} - Error parsing rating from #acrPopover: {e}")
-        pass
-
-    if not rating:
-        try:
-            alt_elem = await page.query_selector('i.a-icon-alt')
-            if alt_elem:
-                text = (await alt_elem.inner_text()).strip()
-                m = re.search(r'(\d+(?:[.,]\d+)?) out of 5', text.replace(',', '.'))
-                if m:
-                    rating = m.group(1)
-        except Exception as e:
-            logging.debug(f"ASIN from URL {url} - Error parsing rating from i.a-icon-alt: {e}")
-            pass
-
-    if not rating:
-        try:
-            td = await page.query_selector('xpath=//th[contains(normalize-space(text()),"Customer Reviews")]/following-sibling::td | //div[@id="averageCustomerReviews"]//span[contains(@class, "a-size-base")]')
-            if td:
-                td_text = await td.inner_text()
-                m = re.search(r'(\d+(?:[.,]\d+)?) out of 5', td_text.replace(',', '.'))
-                if m:
-                    rating = m.group(1)
-                # 如果上面没匹配到，尝试从td_text中直接找评论数（作为备用）
-                if not review_count:
-                    m_rev_alt = re.search(r'([\d,]+)\s+(?:ratings|customer reviews)', td_text, re.IGNORECASE)
-                    if m_rev_alt:
-                        review_count = m_rev_alt.group(1).replace(',', '')
-            else: # 终极备用
-                 customer_reviews_text_element = await page.query_selector('#averageCustomerReviews_feature_div span.a-declarative a span.a-size-base')
-                 if customer_reviews_text_element:
-                     text = await customer_reviews_text_element.inner_text()
-                     m = re.search(r'(\d+(?:[.,]\d+)?) out of 5', text.replace(',', '.'))
-                     if m:
-                         rating = m.group(1)
-
-
-        except Exception as e:
-            logging.debug(f"ASIN from URL {url} - Error parsing rating from Customer Reviews td/averageCustomerReviews: {e}")
-            pass
+    for strategy in rating_strategies:
+        if rating:  # 如果已获取到评分，跳出
+            break
             
-    # 再次尝试从 detailBullets 区域获取评分和评论数 (作为补充)
-    if not rating or not review_count:
         try:
-            detail_bullets_acr_text = await page.query_selector('#detailBullets_averageCustomerReviews #acrCustomerReviewText')
-            if detail_bullets_acr_text:
-                review_text_raw_db = (await detail_bullets_acr_text.inner_text()).strip()
-                m_rev_db = re.search(r'([\d,]+)', review_text_raw_db)
-                if m_rev_db:
-                    review_count = m_rev_db.group(1).replace(',', '') # 可能会覆盖之前的，确保取到
+            if strategy['selector'].startswith('xpath='):
+                elem = await page.query_selector(strategy['selector'])
+            else:
+                elem = await page.query_selector(strategy['selector'])
+            
+            if elem:
+                if strategy['attr'] == 'title':
+                    text = await elem.get_attribute('title') or ''
+                else:
+                    text = await elem.inner_text()
+                
+                text = text.replace(',', '.').strip()
+                match = re.search(strategy['pattern'], text)
+                if match:
+                    rating = match.group(1)
+                    logging.info(f"ASIN from URL {url} - Rating parsed via {strategy['name']}: {rating}")
+                    break
 
-            detail_bullets_popover = await page.query_selector('#detailBullets_averageCustomerReviews #acrPopover')
-            if detail_bullets_popover:
-                title_db = await detail_bullets_popover.get_attribute('title')
-                if title_db:
-                    m_db = re.search(r'(\d+(?:[.,]\d+)?) out of 5', title_db.replace(',', '.'))
-                    if m_db:
-                        rating = m_db.group(1) # 可能会覆盖之前的
         except Exception as e:
-            logging.debug(f"ASIN from URL {url} - Error parsing rating/reviews from detailBullets: {e}")
-            pass
+            logging.debug(f"ASIN from URL {url} - Rating strategy {strategy['name']} failed: {e}")
+            continue
+
+    # 多重兜底评论数解析策略
+    review_strategies = [
+        # 策略1: 标准评论链接
+        {
+            'name': 'standard_review_link',
+            'selector': '#acrCustomerReviewText',
+            'pattern': r'([\d,]+)'
+        },
+        # 策略2: 评论链接变体
+        {
+            'name': 'review_link_variant',
+            'selector': 'a[href*="reviews"] span, span[id*="review"]',
+            'pattern': r'([\d,]+)\s*(?:评论|reviews?|ratings?)'
+        },
+        # 策略3: Customer Reviews表格中的评论数
+        {
+            'name': 'table_review_count',
+            'selector': 'xpath=//th[contains(normalize-space(text()),"Customer Reviews") or contains(normalize-space(text()),"推荐度")]/../td',
+            'pattern': r'([\d,]+)\s*(?:评论|reviews?|ratings?)'
+        }
+    ]
+
+    for strategy in review_strategies:
+        if review_count:  # 如果已获取到评论数，跳出
+            break
+            
+        try:
+            if strategy['selector'].startswith('xpath='):
+                elem = await page.query_selector(strategy['selector'])
+            else:
+                elem = await page.query_selector(strategy['selector'])
+            
+            if elem:
+                text = await elem.inner_text()
+                match = re.search(strategy['pattern'], text, re.IGNORECASE)
+                if match:
+                    review_count = match.group(1).replace(',', '')
+                    logging.info(f"ASIN from URL {url} - Review count parsed via {strategy['name']}: {review_count}")
+                    break
+                    
+        except Exception as e:
+            logging.debug(f"ASIN from URL {url} - Review count strategy {strategy['name']} failed: {e}")
+            continue
 
     if rating:
         rating = rating.strip()
@@ -197,6 +688,9 @@ async def fetch_product_data(page, url):
             review_count = m.group(1)
         else:
             review_count = '' # 如果正则匹配失败，说明格式不对，清空
+    
+    # 最终日志记录
+    logging.info(f"ASIN from URL {url} - Final parsed data: BSR={main_rank}/{main_category}, Sub={sub_rank}/{sub_category}, Rating={rating}, Reviews={review_count}")
 
     return main_category, main_rank, sub_category, sub_rank, rating, review_count
 
@@ -318,31 +812,67 @@ async def run_vine_scraper(df, results_list_ref, concurrency, user_data_dir):
     """
     使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
     """
+    # 使用默认英文环境，依赖精确的多语言BSR解析
+    target_locale = 'en-US'
+    target_timezone = 'America/New_York'
+    accept_language = 'en-US,en;q=0.9'
+    
+    logging.info(f"[Vine] 使用标准环境: {target_locale}, 时区: {target_timezone}")
+    
     async with async_playwright() as pw:
         # 使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
         context = await pw.chromium.launch_persistent_context(
             user_data_dir,
-            headless=True,
-            executable_path=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            headless=False,
+            executable_path=r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
             user_agent=DEFAULT_USER_AGENT,
-            locale='en-US',
-            timezone_id='America/Los_Angeles',
+            locale=target_locale,
+            timezone_id=target_timezone,
             viewport={'width': 1920, 'height': 1080}
         )
         page = await context.new_page()
+        await page.set_extra_http_headers({
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": accept_language
+        })
         # 初始化 Vine 评论抓取的进度条
         pbar = tqdm(total=len(df), desc='Vine Scraping')
-        await page.set_extra_http_headers({"User-Agent": DEFAULT_USER_AGENT})
+        await page.set_extra_http_headers({
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": accept_language
+        })
         # 登录状态已持久化，直接开始抓取 Vine 评论
         for idx, row in enumerate(df.itertuples(index=False)):
             asin = getattr(row, 'ASIN', '')
             country = getattr(row, 'country', '').upper()
             domain = DOMAIN_MAP.get(country, 'amazon.com')
-            # 获取 Vine 评论总数和最后一页前三条评论平均评分
-            vine_count, latest3_rating = await fetch_vine_count(page, asin, domain)
+            # 获取 Vine 评论总数和最后一页前三条评论平均评分，并对单条异常进行捕获，避免批次中断
+            try:
+                vine_count, latest3_rating = await fetch_vine_count(page, asin, domain)
+                status = '成功'
+            except Exception as e_vine_one:
+                # 捕获单条异常，输出日志但不中断后续流程
+                logging.error(f"ASIN={asin} - Vine scraping error: {e_vine_one}")
+                vine_count, latest3_rating = 0, 0.0
+                status = '失败'
+
+            # 确保 results_list_ref 对应位置存在可写字典
+            if idx >= len(results_list_ref) or results_list_ref[idx] is None:
+                results_list_ref[idx] = {
+                    'ASIN': asin,
+                    'country': country
+                }
+
             results_list_ref[idx]['vine_count'] = vine_count
             results_list_ref[idx]['latest3_rating'] = latest3_rating
-            logging.info(f"ASIN={asin} - Vine count updated: {vine_count}, latest3_rating: {latest3_rating}")
+
+            # 控制台输出爬取情况，同时写入日志
+            msg = f"[Vine] {asin} - {status}: count={vine_count}, rating={latest3_rating}"
+            print(msg)
+            if status == '成功':
+                logging.info(msg)
+            else:
+                logging.error(msg)
             # 更新进度条
             pbar.update(1)
         # 完成后关闭进度条并关闭浏览器
@@ -354,19 +884,29 @@ async def login_flow(profile_dir, login_url):
     """
     使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
     """
+    # 使用默认英文环境，依赖精确的多语言BSR解析
+    target_locale = 'en-US'
+    target_timezone = 'America/New_York'
+    accept_language = 'en-US,en;q=0.9'
+    
+    logging.info(f"[Login] 使用标准环境: {target_locale}, 时区: {target_timezone}")
+    
     async with async_playwright() as pw:
         # 使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
         context = await pw.chromium.launch_persistent_context(
             profile_dir,
             headless=False,
-            executable_path=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            executable_path=r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
             user_agent=DEFAULT_USER_AGENT,
-            locale='en-US',
-            timezone_id='America/Los_Angeles',
+            locale=target_locale,
+            timezone_id=target_timezone,
             viewport={'width': 1920, 'height': 1080}
         )
         page = await context.new_page()
-        await page.set_extra_http_headers({"User-Agent": DEFAULT_USER_AGENT})
+        await page.set_extra_http_headers({
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": accept_language
+        })
         await page.goto(login_url)
         input("请在浏览器中完成登录后按回车继续...")
         # 会话预热：模拟人类行为，确保 Cookie 写入
@@ -409,21 +949,32 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir):
     """
     使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
     """
+    # 使用默认英文环境，依赖精确的多语言BSR解析
+    target_locale = 'en-US'
+    target_timezone = 'America/New_York'
+    accept_language = 'en-US,en;q=0.9'
+    
+    logging.info(f"使用标准环境: {target_locale}, 时区: {target_timezone}")
+    
     async with async_playwright() as pw:
         # 使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
         context = await pw.chromium.launch_persistent_context(
             profile_dir,
-            headless=True,
-            executable_path=r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            headless=False,
+            executable_path=r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
             user_agent=DEFAULT_USER_AGENT,
-            locale='en-US',
-            timezone_id='America/Los_Angeles',
+            locale=target_locale,
+            timezone_id=target_timezone,
             viewport={'width': 1920, 'height': 1080}
         )
+        
         pages = []
         for _ in range(concurrency):
             page = await context.new_page()
-            await page.set_extra_http_headers({"User-Agent": DEFAULT_USER_AGENT})
+            await page.set_extra_http_headers({
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept-Language": accept_language
+            })
             # 注释掉静态资源拦截，恢复完整资源加载
             # async def _intercept_route(route):
             #     if route.request.resource_type in ["image", "stylesheet", "font", "media"]:
@@ -570,13 +1121,14 @@ def main(input_file, output_file, encoding, sep, concurrency, profile_dir):
         return
 
     out_df = pd.DataFrame(valid_results)
+    abs_out_path = os.path.abspath(output_file)
     try:
-        out_df.to_csv(output_file, index=False, encoding='utf-8-sig') # 使用 utf-8-sig 确保 Excel 正确打开
-        print(f'数据已保存到 {output_file}')
-        logging.info(f'数据已保存到 {output_file}')
+        out_df.to_csv(abs_out_path, index=False, encoding='utf-8-sig')  # 使用 utf-8-sig 确保 Excel 正确打开
+        print(f'数据已保存到 {abs_out_path}')
+        logging.info(f'数据已保存到 {abs_out_path}')
     except Exception as e_save:
-        print(f"错误: 无法保存结果到 '{output_file}': {e_save}")
-        logging.error(f"无法保存结果到 '{output_file}': {e_save}")
+        print(f"错误: 无法保存结果到 '{abs_out_path}': {e_save}")
+        logging.error(f"无法保存结果到 '{abs_out_path}': {e_save}")
 
     # 再跑 Vine 抓取，使用指定的用户数据目录持久化登录信息
     try:
@@ -587,8 +1139,18 @@ def main(input_file, output_file, encoding, sep, concurrency, profile_dir):
         return
     # 最终保存包括 Vine 的完整结果
     final_df = pd.DataFrame(results_data)
-    final_df.to_csv(output_file, index=False, encoding='utf-8-sig')
-    print(f'完整数据已保存至 {output_file}')
+    abs_final_path = os.path.abspath(output_file)
+    try:
+        final_df.to_csv(abs_final_path, index=False, encoding='utf-8-sig')
+        if os.path.exists(abs_final_path):
+            print(f'完整数据已保存至 {abs_final_path}')
+            logging.info(f'完整数据已保存至 {abs_final_path}')
+        else:
+            print(f'警告: 尝试保存到 {abs_final_path} 但文件未找到，请检查写入权限。')
+            logging.warning(f'尝试保存到 {abs_final_path} 但文件未找到，请检查写入权限。')
+    except Exception as e_final:
+        print(f"错误: 无法保存完整结果到 '{abs_final_path}': {e_final}")
+        logging.error(f"无法保存完整结果到 '{abs_final_path}': {e_final}")
 
 if __name__ == '__main__':
     main()
