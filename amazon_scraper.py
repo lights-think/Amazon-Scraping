@@ -10,6 +10,7 @@ import os
 import json
 import time
 
+
 # 日志配置：仅写入文件 spider.log
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -107,6 +108,42 @@ async def extract_bsr_from_node(node):
         r'([0-9]+(?:,[0-9]{3})*)位([^0-9（\(]+?)(?:\s*（|\s*\(|$)',  # 日语
         r'(?:排第|排名第)([0-9,，]+)名\s*([^排名（]+?)(?:\s*（|$)'  # 中文
     ]
+    
+    # 新增：处理特殊情况，当节点是包含"Best Sellers Rank"的span时，先提取父类再递归处理子类
+    span_text = ""
+    try:
+        span_text = await node.inner_text()
+        span_text = re.sub(r'\s+', ' ', span_text).strip()
+    except:
+        pass
+    
+    if "Best Sellers Rank" in span_text or "Amazon Best Sellers Rank" in span_text:
+        # 这可能是一个包含父类和子类的复合结构
+        logging.info(f"[BSR-SPAN] 发现复合BSR结构: '{span_text}'")
+        
+        # 1. 先从span文本中提取父类信息
+        for pattern in patterns_en:
+            matches = re.findall(pattern, span_text, re.IGNORECASE)
+            for m in matches:
+                rank_str = m[0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
+                cat = m[1].strip().rstrip(')）')
+                if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                    results.append((rank_str, cat))
+                    logging.info(f"[BSR-SPAN-PARENT] 提取到父类: ({rank_str}, {cat})")
+        
+        # 2. 然后查找并处理内部的ul/li结构获取子类信息
+        ul_nodes = await node.query_selector_all('ul')
+        for ul_node in ul_nodes:
+            sub_results = await extract_bsr_from_node(ul_node)
+            if sub_results:
+                results.extend(sub_results)
+                logging.info(f"[BSR-SPAN-CHILDREN] 提取到子类: {sub_results}")
+        
+        # 如果已经找到结果，直接返回
+        if results:
+            return results
+    
+    # 继续原有的处理逻辑
     li_nodes = await node.query_selector_all(':scope > li')
     if li_nodes:
         for li in li_nodes:
@@ -123,6 +160,34 @@ async def extract_bsr_from_node(node):
                 else:
                     text = await li.inner_text()
             text = re.sub(r'\s+', ' ', text).strip()
+            # --- 增强：结构化提取BSR，精准区分导航li和真实BSR li ---
+            NAV_PHRASES = [
+                'See Top 100 in ', 'Top 100 in ',
+                'Visualizza i Top 100 nella categoria', 'Ver el Top 100 en',
+                'Visa Topp 100 i', 'Voir les 100 premiers en',
+                'Ver os 100 mais vendidos em', 'Top 100 auf',
+                'Top 100 in', 'Top 100 dans', 'Top 100 en',
+                'Top 100 dei', 'Top 100 der', 'Top 100 de',
+            ]
+            text_stripped = text.strip()
+            # 1. 导航li判别：以导航短语开头或包含导航短语，直接跳过
+            # 增强：特别过滤掉排名为100的导航链接项
+            if (any(nav_phrase in text_stripped for nav_phrase in NAV_PHRASES) and 
+                (not re.search(r'[#nNoNr\d]', text_stripped) or 
+                 re.search(r'[#nNoNr\.\s]*100\s+in\s+', text_stripped, re.IGNORECASE))):
+                logging.info(f"[BSR-NAV-SKIP] 跳过导航链接: '{text_stripped}'")
+                continue
+            # 2. 若li主文本为"#N in "，a标签文本为category，则category取a标签文本
+            m = re.match(r'[#nNoNr\.\s]*(\d+[,.\d]*)\s+in\s*$', text_stripped, re.IGNORECASE)
+            if m:
+                rank_str = m.group(1).replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
+                a = await li.query_selector('a')
+                if a:
+                    cat = (await a.inner_text()).strip().rstrip(')）')
+                    if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                        results.append((rank_str, cat))
+                        continue
+            # 3. 其余情况按原有正则提取
             found = False
             # 优先英文正则
             for pattern in patterns_en:
@@ -131,6 +196,10 @@ async def extract_bsr_from_node(node):
                     rank_str = m[0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
                     cat = m[1].strip().rstrip(')）')
                     if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                        # 增强：排除可能的导航链接（排名为100且文本包含导航短语）
+                        if int(rank_str) == 100 and any(nav_phrase in text for nav_phrase in NAV_PHRASES):
+                            logging.info(f"[BSR-FILTER] 排除导航链接: rank={rank_str}, category={cat}, text='{text}'")
+                            continue
                         results.append((rank_str, cat))
                         found = True
             # 只要英文正则没命中，再尝试其他语言
@@ -141,6 +210,10 @@ async def extract_bsr_from_node(node):
                         rank_str = m[0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
                         cat = m[1].strip().rstrip(')）')
                         if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                            # 增强：排除可能的导航链接（排名为100且文本包含导航短语）
+                            if int(rank_str) == 100 and any(nav_phrase in text for nav_phrase in NAV_PHRASES):
+                                logging.info(f"[BSR-FILTER] 排除导航链接: rank={rank_str}, category={cat}, text='{text}'")
+                                continue
                             results.append((rank_str, cat))
             logging.info(f"[BSR-LI] li_text='{text}' matches={results}")
     else:
@@ -153,6 +226,10 @@ async def extract_bsr_from_node(node):
                 rank_str = m[0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
                 cat = m[1].strip().rstrip(')）')
                 if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                    # 增强：排除可能的导航链接（排名为100且文本包含导航短语）
+                    if int(rank_str) == 100 and any(nav_phrase in text for nav_phrase in NAV_PHRASES):
+                        logging.info(f"[BSR-FILTER-NON-LI] 排除导航链接: rank={rank_str}, category={cat}, text='{text}'")
+                        continue
                     results.append((rank_str, cat))
                     found = True
         if not found:
@@ -162,6 +239,10 @@ async def extract_bsr_from_node(node):
                     rank_str = m[0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
                     cat = m[1].strip().rstrip(')）')
                     if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                        # 增强：排除可能的导航链接（排名为100且文本包含导航短语）
+                        if int(rank_str) == 100 and any(nav_phrase in text for nav_phrase in NAV_PHRASES):
+                            logging.info(f"[BSR-FILTER-NON-LI] 排除导航链接: rank={rank_str}, category={cat}, text='{text}'")
+                            continue
                         results.append((rank_str, cat))
         logging.info(f"[BSR-NON-LI] text='{text}' matches={results}")
     return results
@@ -223,7 +304,29 @@ async def fetch_product_data(page, url):
                     main_rank, main_category, sub_rank, sub_category = '', '', '', ''
                     main_idx = -1
                     # 1. 优先li文本含'Top 100'或'See Top 100'为主类
-                    li_texts = []
+                    # 添加局部正则列表，供下方提取排名使用
+                    patterns_en = [
+                        r'(?:#|No\.)?\s*([0-9]+(?:,[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)'
+                    ]
+                    patterns_other = [
+                        r'#([0-9]+(?:\s+[0-9]{3})*)\s+i\s+([^(#]+?)(?:\s*\(|$)',  # 瑞典
+                        r'#([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',  # 荷兰/英文
+                        r'(?:nº|n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+en\s+([^(#]+?)(?:\s*\(|$)',  # 西班牙
+                        r'(?:n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+dans\s+([^(#]+?)(?:\s*\(|$)',  # 法语
+                        r'(?:Nr\.|Rang\s+Nr\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+(?:in|bei)\s+([^(#]+?)(?:\s*\(|$)',  # 德语
+                        r'n\.\s*([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',  # 意大利
+                        r'([0-9]+(?:,[0-9]{3})*)位([^0-9（\(]+?)(?:\s*（|\s*\(|$)',  # 日语
+                        r'(?:排第|排名第)([0-9,，]+)名\s*([^排名（]+?)(?:\s*（|$)'  # 中文
+                    ]
+                    NAV_PHRASES = [
+                        'See Top 100 in ', 'Top 100 in ',
+                        'Visualizza i Top 100 nella categoria', 'Ver el Top 100 en',
+                        'Visa Topp 100 i', 'Voir les 100 premiers en',
+                        'Ver os 100 mais vendidos em', 'Top 100 auf',
+                        'Top 100 in', 'Top 100 dans', 'Top 100 en',
+                        'Top 100 dei', 'Top 100 der', 'Top 100 de',
+                    ]
+                    li_texts = []  # 仅记录产生排名的li文本，顺序与bsr_list对齐
                     li_nodes = await ul_node.query_selector_all(':scope > li')
                     for li in li_nodes:
                         text = ''
@@ -237,10 +340,38 @@ async def fetch_product_data(page, url):
                             else:
                                 text = await li.inner_text()
                         text = re.sub(r'\s+', ' ', text).strip()
-                        li_texts.append(text)
-                    # 匹配li_texts和bsr_list顺序
-                    for i, text in enumerate(li_texts):
-                        if 'Top 100' in text or 'See Top 100' in text:
+                        # 同步 regex 提取判断以决定是否加入 bsr_list 和 li_texts
+                        found_local = False
+                        tmp_results = []
+                        for pattern in patterns_en:
+                            matches = re.findall(pattern, text, re.IGNORECASE)
+                            for m in matches:
+                                rank_str = m[0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
+                                cat = m[1].strip().rstrip(')）')
+                                if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                                    tmp_results.append((rank_str, cat))
+                                    found_local = True
+                        if not found_local:
+                            for pattern in patterns_other:
+                                matches = re.findall(pattern, text, re.IGNORECASE)
+                                for m in matches:
+                                    rank_str = m[0].replace(',', '').replace('.', '').replace(' ', '').replace('，', '')
+                                    cat = m[1].strip().rstrip(')）')
+                                    if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                                        tmp_results.append((rank_str, cat))
+                                        found_local = True
+                        if found_local:
+                            bsr_list.extend(tmp_results)  # 按出现顺序追加
+                            li_texts.append(text)  # 仅记录有效li文本
+                            logging.info(f"[BSR-LI-VALID] li_text='{text}' matches={tmp_results}")
+                        else:
+                            logging.info(f"[BSR-LI-SKIP] li_text='{text}' skipped (no rank)")
+                    # 匹配li_texts和bsr_list顺序现在天然一致
+                    # 1. 优先li文本含'Top 100'或'See Top 100'为主类
+                    main_idx = -1
+                    for i, raw_text in enumerate(li_texts):
+                        cleaned = re.sub(r'\([^\)]*\)', '', raw_text)
+                        if 'Top 100' in cleaned or 'See Top 100' in cleaned:
                             main_idx = i
                             break
                     reason = ''
@@ -257,10 +388,19 @@ async def fetch_product_data(page, url):
                     # 3. 子类为其余项中排名最小且与主类不同的项
                     sub_idx = -1
                     if main_idx >= 0 and len(bsr_list) > 1:
-                        sub_candidates = [(i, int(r[0])) for i, r in enumerate(bsr_list) if i != main_idx and r[0].isdigit() and r[1] and (r[0] != main_rank or r[1] != main_category)]
+                        # 修正：子类的品类名必须和主类不同，且排除排名为100的可能干扰项
+                        sub_candidates = []
+                        for i, r in enumerate(bsr_list):
+                            if (i != main_idx and r[0].isdigit() and r[1] and 
+                                r[1] != main_category and 
+                                (int(r[0]) != 100 or not any(nav_phrase in li_texts[i] for nav_phrase in NAV_PHRASES))):
+                                sub_candidates.append((i, int(r[0])))
+                        
                         if sub_candidates:
+                            # 选择排名最小的作为子类
                             sub_idx = min(sub_candidates, key=lambda x: x[1])[0]
                             sub_rank, sub_category = bsr_list[sub_idx]
+                            logging.info(f"[子类选择] 从{len(sub_candidates)}个候选项中选择: ({sub_rank},{sub_category})")
                     logging.info(f"[BSR分配] li_texts={li_texts} bsr_list={bsr_list} main=({main_rank},{main_category}) sub=({sub_rank},{sub_category}) 判别理由={reason}")
                     break
                 # 否则按原有正则处理
@@ -304,15 +444,95 @@ async def fetch_product_data(page, url):
             for ul_node in ul_nodes:
                 bsr_list = await extract_bsr_from_node(ul_node)
                 if bsr_list:
-                    main_rank, main_category = bsr_list[0]
-                    if len(bsr_list) > 1:
-                        sub_rank, sub_category = bsr_list[1]
+                    # 修改：不再简单地取前两个元素作为主类和子类
+                    # 而是应用与表格结构相同的主类/子类选择逻辑
+                    NAV_PHRASES = [
+                        'See Top 100 in ', 'Top 100 in ',
+                        'Visualizza i Top 100 nella categoria', 'Ver el Top 100 en',
+                        'Visa Topp 100 i', 'Voir les 100 premiers en',
+                        'Ver os 100 mais vendidos em', 'Top 100 auf',
+                        'Top 100 in', 'Top 100 dans', 'Top 100 en',
+                        'Top 100 dei', 'Top 100 der', 'Top 100 de',
+                    ]
+                    
+                    # 获取每个BSR项对应的原始文本，用于后续判断
+                    li_nodes = await ul_node.query_selector_all(':scope > li')
+                    li_texts = []
+                    for li in li_nodes:
+                        text = await li.inner_text()
+                        text = re.sub(r'\s+', ' ', text).strip()
+                        li_texts.append(text)
+                    
+                    # 1. 优先li文本含'Top 100'或'See Top 100'为主类
+                    main_idx = -1
+                    for i, raw_text in enumerate(li_texts):
+                        if i < len(bsr_list):  # 确保索引在范围内
+                            cleaned = re.sub(r'\([^\)]*\)', '', raw_text)
+                            if 'Top 100' in cleaned or 'See Top 100' in cleaned:
+                                main_idx = i
+                                break
+                    
+                    # 2. 无Top 100则排名最大为主类
+                    if main_idx < 0 and bsr_list:
+                        ranks = [(i, int(r[0])) for i, r in enumerate(bsr_list) if r[0].isdigit()]
+                        if ranks:
+                            main_idx = max(ranks, key=lambda x: x[1])[0]
+                    
+                    # 设置主类
+                    if main_idx >= 0 and main_idx < len(bsr_list):
+                        main_rank, main_category = bsr_list[main_idx]
+                        
+                        # 3. 子类为其余项中排名最小且与主类不同的项
+                        sub_idx = -1
+                        if main_idx >= 0 and len(bsr_list) > 1:
+                            # 修正：子类的品类名必须和主类不同，且排除排名为100的可能干扰项
+                            sub_candidates = []
+                            for i, r in enumerate(bsr_list):
+                                if (i != main_idx and r[0].isdigit() and r[1] and 
+                                    r[1] != main_category and 
+                                    (int(r[0]) != 100 or not any(nav_phrase in li_texts[i] if i < len(li_texts) else False for nav_phrase in NAV_PHRASES))):
+                                    sub_candidates.append((i, int(r[0])))
+                            
+                            if sub_candidates:
+                                # 选择排名最小的作为子类
+                                sub_idx = min(sub_candidates, key=lambda x: x[1])[0]
+                                sub_rank, sub_category = bsr_list[sub_idx]
+                                logging.info(f"[子类选择] 从{len(sub_candidates)}个候选项中选择: ({sub_rank},{sub_category})")
                     else:
-                        sub_rank, sub_category = '', ''
-                    logging.info(f"ASIN from URL {url} - BSR parsed via UL structure: {bsr_list}")
+                        # 如果没有找到合适的主类但有BSR数据，使用第一个作为主类
+                        if bsr_list:
+                            main_rank, main_category = bsr_list[0]
+                            # 如果有多个项，使用第二个作为子类（如果与主类不同）
+                            if len(bsr_list) > 1 and bsr_list[1][1] != main_category:
+                                sub_rank, sub_category = bsr_list[1]
+                    
+                    logging.info(f"ASIN from URL {url} - BSR parsed via UL structure: {bsr_list}, 主类=({main_rank},{main_category}), 子类=({sub_rank},{sub_category})")
                     break
         except Exception as e:
             logging.warning(f"UL structure BSR extraction error: {e}")
+
+    # 新增策略：直接查找包含"Best Sellers Rank"的span元素
+    if not main_rank:
+        try:
+            # 查找包含"Best Sellers Rank"的span元素
+            bsr_spans = await page.query_selector_all('span:has-text("Best Sellers Rank"), span:has-text("Amazon Best Sellers Rank")')
+            for span in bsr_spans:
+                bsr_list = await extract_bsr_from_node(span)
+                if bsr_list and len(bsr_list) >= 1:
+                    # 第一个通常是父类，后面的是子类
+                    main_rank, main_category = bsr_list[0]
+                    
+                    # 如果有多个BSR项，找出子类（排名最小且与主类不同的项）
+                    if len(bsr_list) > 1:
+                        sub_candidates = [(i, int(r[0])) for i, r in enumerate(bsr_list) if i > 0 and r[0].isdigit() and r[1] != main_category]
+                        if sub_candidates:
+                            sub_idx = min(sub_candidates, key=lambda x: x[1])[0]
+                            sub_rank, sub_category = bsr_list[sub_idx]
+                    
+                    logging.info(f"ASIN from URL {url} - BSR parsed via span structure: {bsr_list}, 主类=({main_rank},{main_category}), 子类=({sub_rank},{sub_category})")
+                    break
+        except Exception as e:
+            logging.warning(f"Span BSR extraction error: {e}")
 
     # 策略2: 日语格式专门处理 (X位Category)
     if not main_rank:
@@ -708,6 +928,24 @@ async def fetch_product_data(page, url):
     except Exception as e:
         logging.warning(f"BSR父子类排名对比异常: {e}")
 
+    # 返回前进行父子类顺序检查和修正
+    if main_rank and sub_rank and main_rank.isdigit() and sub_rank.isdigit():
+        main_rank_int = int(main_rank)
+        sub_rank_int = int(sub_rank)
+        
+        # 如果子类排名大于主类排名，则交换它们
+        if sub_rank_int > main_rank_int:
+            logging.info(f"[BSR排序修正] 交换父子类顺序: 原父类=({main_rank},{main_category}), 原子类=({sub_rank},{sub_category})")
+            main_rank, sub_rank = sub_rank, main_rank
+            main_category, sub_category = sub_category, main_category
+            logging.info(f"[BSR排序修正] 修正后: 父类=({main_rank},{main_category}), 子类=({sub_rank},{sub_category})")
+    
+    # 如果主类为空但子类不为空，则将子类提升为主类
+    if (not main_rank or not main_category) and sub_rank and sub_category:
+        logging.info(f"[BSR修正] 主类为空，将子类提升为主类: 子类=({sub_rank},{sub_category})")
+        main_rank, main_category = sub_rank, sub_category
+        sub_rank, sub_category = '', ''
+    
     return main_category, main_rank, sub_category, sub_rank, rating, review_count
 
 async def fetch_vine_count(page, asin, domain):
@@ -1028,10 +1266,17 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir):
                 max_retries = 3
                 main_cat, main_rank, sub_cat, sub_rank, rating, reviews = '', '', '', '', '', ''
 
+                # --- 强制Amazon页面尽量以英文显示：为URL拼接language=en_US参数 ---
+                if '?' in url:
+                    url_with_lang = url + '&language=en_US'
+                else:
+                    url_with_lang = url + '?language=en_US'
+                # 传递拼接后的URL给fetch_product_data
+                # 注：解析规则不变，兼容多语言
                 for attempt in range(1, max_retries + 1):
                     logging.info(f"ASIN={asin} - Attempt {attempt}/{max_retries} for product data.")
                     try:
-                        main_cat, main_rank, sub_cat, sub_rank, rating, reviews = await fetch_product_data(page, url)
+                        main_cat, main_rank, sub_cat, sub_rank, rating, reviews = await fetch_product_data(page, url_with_lang)
                         # 检查核心数据是否都获取到
                         if main_rank and rating and reviews: # 主要BSR排名，评分和评论数是核心
                             logging.info(f"ASIN={asin} - Attempt {attempt} successful for core product data.")
