@@ -3,5 +3,5 @@
 *.xlsx
 spider.log
 output.csv
-/my_browser_profile
+/my_browser_profile_*
 __pycache__

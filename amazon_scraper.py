@@ -9,6 +9,8 @@ import random
 import os
 import json
 import time
+import multiprocessing
+from multiprocessing import Process, Manager
 
 
 # 日志配置：仅写入文件 spider.log
@@ -1199,7 +1201,7 @@ def ensure_login(profile_dir, df):
         json.dump({'logged_in': True}, f, ensure_ascii=False)
     print("登录完成，已记录状态。")
 
-async def run_scraper(df, results_list_ref, concurrency, profile_dir):
+async def run_scraper(df, results_list_ref, concurrency, profile_dir, progress_counter=None):
     """
     使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
     """
@@ -1245,7 +1247,8 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir):
         for p in pages:
             await page_queue.put(p)
             
-        pbar = tqdm(total=len(df), desc='Scraping')
+        # 子进程禁用局部进度条，由主进程统一展示
+        pbar = tqdm(total=len(df), desc='Scraping', disable=(progress_counter is not None))
 
         async def process_row(pos, row_data): # Renamed row to row_data
             page = await page_queue.get()
@@ -1315,6 +1318,14 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir):
             finally:
                 await page_queue.put(page)
                 pbar.update(1)
+                # 更新跨进程共享计数器
+                if progress_counter is not None:
+                    try:
+                        with progress_counter.get_lock():
+                            progress_counter.value += 1
+                    except AttributeError:
+                        # Manager.Value 返回的 ValueProxy 无 get_lock()
+                        progress_counter.value += 1
 
         tasks = [asyncio.create_task(process_row(pos, row_data)) for pos, (_, row_data) in enumerate(df.iterrows())]
         await asyncio.gather(*tasks)
@@ -1425,14 +1436,96 @@ async def handle_continue_shopping(page):
         logging.error(f'[CONTINUE_SHOPPING] Exception: {e}')
         return False
 
+def _worker_process(df_slice, profile_dir, concurrency, shared_results, progress_counter):
+    """子进程执行函数：直接运行爬虫并写结果（登录已在主进程完成）"""
+    try:
+        results_data: list = []
+        asyncio.run(run_scraper(df_slice, results_data, concurrency, profile_dir, progress_counter))
+        shared_results.extend([r for r in results_data if r is not None])
+    except Exception as e:
+        logging.error(f"[Worker-{profile_dir}] 发生异常: {e}")
+
+
+def multi_process_scraper(df, profile_template: str, profile_count: int, concurrency: int, output_file: str):
+    """多进程调度：根据模板前缀批量创建 profile 目录并切分任务"""
+    manager = Manager()
+    shared_results = manager.list()
+    progress_counter = manager.Value('i', 0)
+
+    total = len(df)
+    slice_size = (total + profile_count - 1) // profile_count  # 向上取整
+
+    processes = []
+    for idx in range(profile_count):
+        start_idx = idx * slice_size
+        end_idx = min((idx + 1) * slice_size, total)
+        if start_idx >= end_idx:
+            continue  # 可能最后一个切片为空
+        df_slice = df.iloc[start_idx:end_idx].copy()
+        profile_dir = f"{profile_template}{idx}"
+        # --- 主进程内先确保登录（可交互） ---
+        ensure_login(profile_dir, df_slice)
+        p = Process(target=_worker_process, args=(df_slice, profile_dir, concurrency, shared_results, progress_counter))
+        p.start()
+        processes.append(p)
+        logging.info(f"[Master] 已启动子进程 {p.pid}，处理行 {start_idx}-{end_idx - 1}，使用 profile '{profile_dir}'")
+
+    # 主进程统一显示总进度条
+    total_tasks = len(df)
+    pbar_total = tqdm(total=total_tasks, desc='Total Progress')
+    while any(p.is_alive() for p in processes):
+        try:
+            with progress_counter.get_lock():
+                completed = progress_counter.value
+        except AttributeError:
+            completed = progress_counter.value
+        pbar_total.update(completed - pbar_total.n)
+        time.sleep(0.5)
+    # 子进程已全部完成，再做一次最终更新
+    try:
+        with progress_counter.get_lock():
+            completed = progress_counter.value
+    except AttributeError:
+        completed = progress_counter.value
+    pbar_total.update(completed - pbar_total.n)
+    pbar_total.close()
+
+    # 等待子进程结束并记录退出码
+    for p in processes:
+        p.join()
+        logging.info(f"[Master] 子进程 {p.pid} 已结束，exitcode={p.exitcode}")
+
+    # 汇总结果
+    results = [r for r in shared_results if r]
+    if not results:
+        print("警告: 未收集到任何有效数据。请检查日志文件 'spider.log'")
+        logging.warning("multi_process_scraper 未收集到任何有效数据。")
+        return
+
+    out_df = pd.DataFrame(results)
+    abs_out_path = os.path.abspath(output_file)
+    try:
+        out_df.to_csv(abs_out_path, index=False, encoding='utf-8-sig')
+        print(f'数据已保存到 {abs_out_path}')
+        logging.info(f'[Master] 多进程模式: 数据已保存到 {abs_out_path}')
+    except Exception as e:
+        print(f"错误: 无法保存结果到 '{abs_out_path}': {e}")
+        logging.error(f"无法保存结果到 '{abs_out_path}': {e}")
+        return
+
+    # 自动清洗品类
+    clean_and_adjust_categories(output_file)
+
 @click.command()
 @click.option('--input', '-i', 'input_file', default='data/test_input.csv', help='输入CSV/Excel文件路径，包含ASIN和country列')
 @click.option('--encoding', '-e', 'encoding', default='utf-8-sig', help='输入CSV文件编码 (例如 utf-8, utf-8-sig, gbk)')
 @click.option('--sep', '-s', 'sep', default=',', help='输入CSV文件分隔符 (例如 ",", "\\t", ";")')
-@click.option('--concurrency', '-c', 'concurrency', default=5, type=int, help='并发任务数 (建议根据网络和机器性能调整，过高易被封)')
-@click.option('--profile-dir', '-p', 'profile_dir', default='my_browser_profile', help='用于持久化浏览器登录信息的用户数据目录')
+@click.option('--concurrency', '-c', 'concurrency', default=3, type=int, help='单进程内协程并发数 (建议≤5)')
+@click.option('--profile-template', 'profile_template', default='my_browser_profile_', help='用户数据目录前缀模板 (启用多进程时使用)')
+@click.option('--profile-count', 'profile_count', default=0, type=int, help='根据模板创建的目录数量 (>0 时启用多进程)')
+@click.option('--profile-dir', '-p', 'profile_dir', default='my_browser_profile', help='单进程模式下的用户数据目录')
 @click.option('--output', '-o', 'output_file', default='output.csv', help='输出CSV文件路径')
-def main(input_file, output_file, encoding, sep, concurrency, profile_dir):
+def main(input_file, output_file, encoding, sep, concurrency, profile_template, profile_count, profile_dir):
     """
     入口函数：读取输入CSV/Excel，运行爬虫并保存结果到输出CSV
     """
@@ -1458,6 +1551,13 @@ def main(input_file, output_file, encoding, sep, concurrency, profile_dir):
     df['ASIN'] = df['ASIN'].astype(str).str.strip()
     df['country'] = df['country'].astype(str).str.strip()
 
+    # --- 多进程模式判断 ---
+    if profile_count and profile_count > 0:
+        # 使用模板批量创建 profile 目录
+        multi_process_scraper(df, profile_template, profile_count, concurrency, output_file)
+        return  # 结束主函数
+
+    # ===== 兼容原单进程模式 =====
     # 设置用户数据目录并规范化路径
     if not os.path.isabs(profile_dir):
         user_data_dir = os.path.normpath(os.path.join(os.getcwd(), profile_dir))
