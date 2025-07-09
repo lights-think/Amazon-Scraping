@@ -30,7 +30,7 @@ for country in df['country'].unique():
             test_rows.append(low)
     else:
         # 没有销量字段则随机选2个
-        test_rows.extend(sub.sample(n=min(50, len(sub)), random_state=42).to_dict('records'))
+        test_rows.extend(sub.sample(n=min(2, len(sub)), random_state=42).to_dict('records'))
 
 # 去重
 test_df = pd.DataFrame(test_rows).drop_duplicates(subset=['ASIN', 'country'])
