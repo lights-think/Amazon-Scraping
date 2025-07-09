@@ -267,10 +267,39 @@ async def login_flow(profile_dir: str, login_url: str, country: str):
             "User-Agent": DEFAULT_USER_AGENT,
             "Accept-Language": accept_language
         })
+        
+        print(f"\n开始 {country} 站点登录流程...")
+        print(f"1. 正在打开浏览器访问: {login_url}")
         await page.goto(login_url)
-        print(f"请在浏览器中完成 {country} 站点的登录...")
-        user_input = input("登录完成后按回车继续，输入'skip'跳过此国家: ")
-        login_success = user_input.lower() != 'skip'
+        
+        print(f"2. 请在浏览器中完成 {country} 站点的登录")
+        print("   - 输入账号密码并通过可能的验证")
+        print("   - 确认您能看到评论页面")
+        print("   - 完成后回到此命令行窗口")
+        
+        user_input = input("\n请选择操作: \n[1] 登录成功(默认) \n[2] 跳过此国家 \n[3] 登录失败，重试 \n请输入选项(1/2/3): ")
+        
+        if user_input.strip() == '3':
+            print(f"重新尝试登录 {country}...")
+            await page.reload()
+            user_input = input("\n请再次选择操作: \n[1] 登录成功(默认) \n[2] 跳过此国家 \n请输入选项(1/2): ")
+            login_success = user_input.strip() != '2'
+        else:
+            login_success = user_input.strip() != '2'
+        
+        if login_success:
+            print(f"{country} 登录已确认成功!")
+            # 会话预热：模拟人类行为，确保 Cookie 写入
+            try:
+                await page.evaluate("window.scrollBy(0, 500)")
+                await page.wait_for_timeout(1000)
+                await page.evaluate("window.scrollBy(0, -300)")
+                await page.wait_for_timeout(500)
+            except Exception:
+                pass
+        else:
+            print(f"{country} 登录已跳过")
+            
         await context.close()
         return login_success
 
@@ -510,6 +539,37 @@ def multi_process_scraper(df: pd.DataFrame, profile_template: str, profile_count
                 
                 # 更新总登录状态
                 all_login_states[country] = login_success
+    
+    # 显示登录状态并确认是否继续
+    print("\n===== 爬取前登录状态确认 =====")
+    logged_in_countries = []
+    not_logged_countries = []
+    
+    for country in all_countries:
+        if country in all_login_states and all_login_states[country]:
+            logged_in_countries.append(country)
+            status = "已登录"
+        else:
+            not_logged_countries.append(country)
+            status = "未登录"
+        print(f"{country}: {status}")
+    
+    if not logged_in_countries:
+        print("\n警告: 没有任何国家处于登录状态，无法执行爬取")
+        if input("是否返回登录流程? (y/n): ").lower() == 'y':
+            # 重新调用自身，强制登录
+            return multi_process_scraper(df, profile_template, profile_count, concurrency, output_file, True)
+        else:
+            print("程序退出")
+            return
+    
+    if not_logged_countries:
+        print(f"\n注意: 以下国家未登录，相关记录将被跳过: {', '.join(not_logged_countries)}")
+    
+    confirm = input("\n所有登录已完成，是否开始爬取? (y/n): ")
+    if confirm.lower() != 'y':
+        print("爬取已取消，程序退出")
+        return
 
     processes = []
     for idx in range(profile_count):
@@ -597,6 +657,40 @@ def main(input_file, output_file, encoding, sep, concurrency, profile_template, 
     # 如果仅登录模式，则结束
     if login_only:
         print("登录流程已完成，退出程序")
+        return
+    
+    # 显示登录状态并确认是否继续
+    print("\n===== 爬取前登录状态确认 =====")
+    countries = df['country'].str.strip().str.upper().unique()
+    logged_in_countries = []
+    not_logged_countries = []
+    
+    for country in countries:
+        if country in login_states and login_states[country]:
+            logged_in_countries.append(country)
+            status = "已登录"
+        else:
+            not_logged_countries.append(country)
+            status = "未登录"
+        print(f"{country}: {status}")
+    
+    if not logged_in_countries:
+        print("\n警告: 没有任何国家处于登录状态，无法执行爬取")
+        if input("是否返回登录流程? (y/n): ").lower() == 'y':
+            login_states = ensure_login(user_dir, df, True)  # 强制重新登录
+            if not any(login_states.values()):
+                print("仍然没有登录任何国家，程序退出")
+                return
+        else:
+            print("程序退出")
+            return
+    
+    if not_logged_countries:
+        print(f"\n注意: 以下国家未登录，相关记录将被跳过: {', '.join(not_logged_countries)}")
+    
+    confirm = input("\n所有登录已完成，是否开始爬取? (y/n): ")
+    if confirm.lower() != 'y':
+        print("爬取已取消，程序退出")
         return
 
     results = [None] * len(df)
