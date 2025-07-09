@@ -1,14 +1,31 @@
 # Amazon 商品信息爬虫
 
-基于 Python 和 Playwright 的亚马逊商品信息爬虫，支持从 CSV 导入 ASIN 和国家，抓取 BSR（大类和小类）、产品评分和评论数，并输出到 CSV。
+基于 Python 和 Playwright 的亚马逊商品信息爬虫，支持从 CSV/Excel 导入 ASIN 和国家，分为两个独立模块：
+
+1. **主爬虫 (amazon_scraper.py)** - 抓取商品基本信息、BSR排名、评分和评论数
+2. **VINE爬虫 (VINE_Sccrape.py)** - 专门抓取商品的VINE评论数量和最近评论评分
 
 ## 特性
-- 无头运行（Headless Chrome）
+
+### 共同特性
+- 支持无头/可视化运行 Chrome
 - 命令行界面（CLI）
 - 进度条显示（tqdm）
-- CSV 输入/输出
-- 支持主流国家：US、UK、DE、FR、ES、IT、CA、JP、MX、IN
-- 支持抓取 Vine 评论数量和最后三条评论的平均评分（输出字段 `vine_count`、`latest3_rating`）。
+- CSV/Excel 输入/输出
+- 支持多进程并行抓取
+- 支持主流国家：US、UK、DE、FR、ES、IT、CA、JP、MX、IN、NL、SE、BE、IE、AU、BR、SG等
+
+### 主爬虫功能
+- 抓取商品BSR排名（主类和子类）
+- 抓取商品评分和评论数
+- 自动处理多语言网站
+- 支持多进程并行抓取
+
+### VINE爬虫功能
+- 专注抓取VINE评论数量
+- 计算最近评论的平均评分
+- 支持多国家登录状态管理
+- 支持仅登录模式
 
 ## 安装
 
@@ -31,41 +48,108 @@ pip install -r requirements.txt
 playwright install
 ```
 
-> 注意：脚本默认使用系统 Chrome，可执行路径为 Windows: `C:\Program Files\Google\Chrome\Application\chrome.exe`，如安装路径不同，请修改 `amazon_scraper.py` 中 `executable_path` 参数。
+> 注意：脚本默认使用系统 Chrome，可执行路径为 Windows: `C:\Program Files\Google\Chrome\Application\chrome.exe`，如安装路径不同，请修改脚本中 `executable_path` 参数。
 
-## 使用
+## 使用方法
+
+### 主爬虫 (amazon_scraper.py)
 
 ```bash
-# 对 CSV 文件（使用并发参数示例）
-python amazon_scraper.py -i input.csv -o output.csv -e utf-8 -s '\t' -c 10 -p my_browser_profile
+# 基本用法
+python amazon_scraper.py -i input.csv -o output.csv
 
-# 对 Excel 文件 (.xls/.xlsx)
-python amazon_scraper.py -i input.xlsx -o output.csv -p my_browser_profile
+# 高级参数
+python amazon_scraper.py -i input.csv -o output.csv -e utf-8 -s '\t' -c 3 -p my_browser_profile
+
+# 多进程模式
+python amazon_scraper.py -i input.csv -o output.csv --profile-template my_profile_ --profile-count 4
 ```
 
-- `input.csv`/`input.xlsx` 应包含 `ASIN` 和 `country` 列
-- 对 CSV 文件，可通过 `-e`/`--encoding` 指定输入文件编码（默认 `utf-8`)，通过 `-s`/`--sep` 指定分隔符（默认 `,`)
-- 可通过 `-c`/`--concurrency` 指定并发任务数（默认 5）
-- 可通过 `-p`/`--profile-dir` 指定用户数据目录（默认 `my_browser_profile`），用于持久化浏览器登录信息。
+参数说明:
+- `-i/--input`: 输入文件路径 (CSV或Excel)
+- `-o/--output`: 输出文件路径 (CSV)
+- `-e/--encoding`: 输入CSV文件编码 (默认 utf-8-sig)
+- `-s/--sep`: 输入CSV分隔符 (默认 ,)
+- `-c/--concurrency`: 单进程内协程并发数 (默认 3)
+- `-p/--profile-dir`: 单进程模式用户数据目录 (默认 my_browser_profile)
+- `--profile-template`: 多进程模式用户数据目录前缀
+- `--profile-count`: 多进程数量 (>0时启用多进程)
 
-首次运行时如未检测到登录状态，脚本会打开可视化浏览器进行登录 Vine 评论页面，登录完成后会保存登录状态，后续运行无需重复登录。
+输出字段:
+- `ASIN`: 商品ASIN
+- `country`: 国家代码
+- `url`: 商品URL
+- `bsr_main_category`: 主分类名称
+- `bsr_main_rank`: 主分类排名
+- `bsr_sub_category`: 子分类名称
+- `bsr_sub_rank`: 子分类排名
+- `rating`: 平均评分
+- `review_count`: 评论数量
 
-- 输出文件 `output.csv` 将包含抓取结果：
-  - `bsr_main_category`：主分类名称
-  - `bsr_main_rank`：主分类排名
-  - `bsr_sub_category`：子分类名称
-  - `bsr_sub_rank`：子分类排名
-  - `rating`：平均评分
-  - `review_count`：评论数量
-  - `vine_count`：Vine 评论数量
-  - `latest3_rating`：最后一页前三条评论的平均评分
+### VINE爬虫 (VINE_Sccrape.py)
+
+```bash
+# 基本用法
+python VINE_Sccrape.py -i input.csv -o vine_output.csv
+
+# 仅登录模式
+python VINE_Sccrape.py -i input.csv --login-only
+
+# 强制重新登录
+python VINE_Sccrape.py -i input.csv -o vine_output.csv --force-login
+
+# 多进程模式
+python VINE_Sccrape.py -i input.csv -o vine_output.csv --profile-template vine_profile_ --profile-count 4
+```
+
+参数说明:
+- `-i/--input`: 输入文件路径 (CSV或Excel)
+- `-o/--output`: 输出文件路径 (CSV)
+- `-e/--encoding`: 输入CSV文件编码 (默认 utf-8-sig)
+- `-s/--sep`: 输入CSV分隔符 (默认 ,)
+- `-c/--concurrency`: 单进程内协程并发数 (默认 3)
+- `-p/--profile-dir`: 单进程模式用户数据目录 (默认 my_browser_profile)
+- `--profile-template`: 多进程模式用户数据目录前缀
+- `--profile-count`: 多进程数量 (>0时启用多进程)
+- `--force-login`: 强制重新登录所有国家
+- `--login-only`: 仅执行登录流程，不进行爬取
+
+输出字段:
+- `ASIN`: 商品ASIN
+- `country`: 国家代码
+- `vine_count`: VINE评论数量
+- `latest3_rating`: 最近3条评论的平均评分
+
+## 输入文件格式
+
+输入文件 (CSV或Excel) 必须包含以下列:
+- `ASIN`: 商品ASIN编码
+- `country`: 国家代码 (如US, UK, DE等)
+
+示例:
+```
+ASIN,country
+B07PXGQC1Q,US
+B08F2YD1GM,UK
+B07ZGLLWBT,DE
+```
+
+## 登录流程
+
+首次运行VINE爬虫时，系统会打开浏览器窗口引导您登录Amazon账户。登录成功后，状态将被保存在用户数据目录中，后续运行无需重复登录。
+
+使用`--force-login`参数可强制重新登录，`--login-only`参数可只执行登录而不进行爬取。
 
 ## 定期启动
 
 可以使用系统定时任务（如 `cron`）定期运行：
 
 ```cron
+# 每天凌晨2点运行主爬虫
 0 2 * * * cd /path/to/repo && /usr/bin/python3 amazon_scraper.py -i input.csv -o output.csv
+
+# 每天凌晨3点运行VINE爬虫
+0 3 * * * cd /path/to/repo && /usr/bin/python3 VINE_Sccrape.py -i input.csv -o vine_output.csv
 ```
 
 ## 开源协议
