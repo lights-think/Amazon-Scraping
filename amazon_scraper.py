@@ -1180,26 +1180,10 @@ async def login_flow(profile_dir, login_url):
         await context.close()
 
 def ensure_login(profile_dir, df):
-    login_file = os.path.join(profile_dir, 'login_state.json')
-    os.makedirs(profile_dir, exist_ok=True)
-    if os.path.exists(login_file):
-        try:
-            with open(login_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if data.get('logged_in'):
-                return
-        except:
-            pass
-    # 未登录，开始登录流程
-    asin = str(df.iloc[0].get('ASIN', '')).strip()
-    country = str(df.iloc[0].get('country', '')).strip().upper()
-    domain = DOMAIN_MAP.get(country, 'amazon.com')
-    login_url = f'https://www.{domain}/product-reviews/{asin}?sortBy=recent&reviewerType=all_reviews&formatType=all_formats&pageNumber=1&pageSize=10'
-    print(f"未检测到登录状态，开始登录流程，登录 URL: {login_url}")
-    asyncio.run(login_flow(profile_dir, login_url))
-    with open(login_file, 'w', encoding='utf-8') as f:
-        json.dump({'logged_in': True}, f, ensure_ascii=False)
-    print("登录完成，已记录状态。")
+    """
+    登录检测已禁用，什么都不做
+    """
+    return
 
 async def run_scraper(df, results_list_ref, concurrency, profile_dir, progress_counter=None):
     """

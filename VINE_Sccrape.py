@@ -47,13 +47,33 @@ async def fetch_vine_count(page, asin: str, domain: str):
     )
     logging.info(f"[VINE] ASIN={asin} initial review page: {first_url}")
 
-    try:
-        await page.goto(first_url, timeout=60000, wait_until='domcontentloaded')
-    except Exception as e:
-        logging.error(f"[VINE] ASIN={asin} navigation error: {e}")
-        return 0, 0.0
-
-    await page.wait_for_timeout(2000)
+    # 页面加载重试机制
+    max_retries = 3
+    for retry in range(max_retries):
+        try:
+            await page.goto(first_url, timeout=60000, wait_until='domcontentloaded')
+            # 等待页面稳定加载
+            await page.wait_for_timeout(2000)
+            
+            # 确保评论区域已加载
+            try:
+                await page.wait_for_selector('div[data-hook="review"], .review, #reviews-section', timeout=10000)
+                break
+            except:
+                if retry < max_retries - 1:
+                    logging.warning(f"[VINE] ASIN={asin} 评论区域未加载，重试 {retry + 1}/{max_retries}")
+                    await page.wait_for_timeout(3000)
+                    continue
+                else:
+                    logging.warning(f"[VINE] ASIN={asin} 评论区域始终未加载，继续尝试")
+                    break
+        except Exception as e:
+            if retry < max_retries - 1:
+                logging.warning(f"[VINE] ASIN={asin} 导航失败，重试 {retry + 1}/{max_retries}: {e}")
+                await page.wait_for_timeout(5000)
+            else:
+                logging.error(f"[VINE] ASIN={asin} navigation error after {max_retries} retries: {e}")
+                return 0, 0.0
 
     # 获取评论总数
     total_reviews = 0
@@ -105,31 +125,167 @@ async def fetch_vine_count(page, asin: str, domain: str):
         except Exception:
             pass
 
-        # JS 评估 Vine 标签
+        # JS 评估 Vine 标签 - 改进的健壮性实现
         try:
             count = await page.evaluate('''() => {
-                return Array.from(document.querySelectorAll('span.a-color-success.a-text-bold'))
-                    .filter(el => el.textContent.trim() === 'Amazon Vine Customer Review of Free Product').length;
+                // 多种VINE标识符策略
+                let vineCount = 0;
+                
+                // 策略1: 标准VINE文本检测（支持多语言）
+                const vineTexts = [
+                    'Amazon Vine Customer Review of Free Product',
+                    'Vine Customer Review of Free Product',
+                    'Vine Customer Review',
+                    'Amazon Vine Customer Review',
+                    'Amazon Vine Kundenrezension',  // 德语
+                    'Vine Kundenrezension',
+                    'Kostenlose Probe'  // 德语："免费样品"
+                ];
+                
+                vineTexts.forEach(vineText => {
+                    const elements = Array.from(document.querySelectorAll('span.a-color-success.a-text-bold, span.a-color-success, .a-color-success'));
+                    const count = elements.filter(el => {
+                        const text = el.textContent ? el.textContent.trim() : '';
+                        return text.includes(vineText);
+                    }).length;
+                    vineCount = Math.max(vineCount, count);
+                });
+                
+                // 策略2: 通过class属性检测vine标识
+                const vineClassElements = Array.from(document.querySelectorAll('[class*="vine"], [data-hook*="vine"], .vine-review, .amazon-vine'));
+                if (vineClassElements.length > 0) {
+                    vineCount = Math.max(vineCount, vineClassElements.length);
+                }
+                
+                // 策略3: 通过绿色文本检测(VINE标识通常是绿色)
+                if (vineCount === 0) {
+                    const greenElements = Array.from(document.querySelectorAll('span.a-color-success, .a-color-success'));
+                    const vineKeywords = [
+                        'vine', 'free product', '免费产品', 
+                        'kostenlos', 'kostenloses produkt', 'gratis',  // 德语关键词
+                        'produit gratuit', 'gratuito',  // 法语、意大利语
+                        'producto gratuito'  // 西班牙语
+                    ];
+                    greenElements.forEach(el => {
+                        const text = el.textContent ? el.textContent.toLowerCase() : '';
+                        if (vineKeywords.some(keyword => text.includes(keyword))) {
+                            vineCount++;
+                        }
+                    });
+                }
+                
+                // 策略4: 通过图标检测(有些VINE评论有特殊图标)
+                if (vineCount === 0) {
+                    const iconElements = Array.from(document.querySelectorAll('i[class*="vine"], img[alt*="vine"], img[title*="vine"]'));
+                    vineCount = Math.max(vineCount, iconElements.length);
+                }
+                
+                return vineCount;
             }''')
             vine_count += count
+            if count > 0:
+                logging.debug(f"[VINE] ASIN={asin} 第{page_num}页找到{count}个VINE评论")
         except Exception as js_e:
             logging.error(f"[VINE] ASIN={asin} JS eval error page {page_num}: {js_e}")
 
-        # 处理最后一页前三条评分
+        # 处理最后一页前三条评分 - 改进的健壮性实现
         if page_num == total_pages:
             try:
                 avg_rating = await page.evaluate('''() => {
-                    const stars = Array.from(document.querySelectorAll('i[data-hook="review-star-rating"] span.a-icon-alt'));
-                    const nums = stars.slice(0, 3).map(el => {
-                        const m = el.textContent.match(/(\d+(?:\.\d+)?)/);
-                        return m ? parseFloat(m[1]) : 0;
-                    });
-                    const valid = nums.filter(n => !isNaN(n));
-                    return valid.length ? valid.reduce((a,b)=>a+b,0)/valid.length : 0;
+                    // 基于测试结果优化的评分选择器策略
+                    const selectors = [
+                        // 最有效的选择器放在前面（基于德国站点测试结果）
+                        'i[data-hook="cmps-review-star-rating"] span.a-icon-alt',
+                        'i.a-icon.a-icon-star span.a-icon-alt',
+                        'i[data-hook="review-star-rating"] span.a-icon-alt',
+                        'span[data-hook="review-star-rating"] span.a-icon-alt',
+                        '.review-rating i span.a-icon-alt',
+                        '.cr-original-review-text i span.a-icon-alt'
+                    ];
+                    
+                    let allRatings = [];
+                    
+                    // 策略1: 优先使用测试验证有效的选择器
+                    for (const selector of selectors) {
+                        const elements = Array.from(document.querySelectorAll(selector));
+                        if (elements.length > 0) {
+                            elements.slice(0, 3).forEach(el => {
+                                const text = el.textContent || '';
+                                // 支持多语言评分文本匹配（英语、德语等）
+                                const match = text.match(/(\d+(?:[,\.]\d+)?)\s*(von|out\s*of)\s*5\s*(stern|star)/i) || 
+                                             text.match(/(\d+(?:[,\.]\d+)?)\s*out\s*of\s*5/i) || 
+                                             text.match(/(\d+(?:[,\.]\d+)?)/);
+                                if (match) {
+                                    // 处理不同的小数点格式（逗号/点号）
+                                    const rating = parseFloat(match[1].replace(',', '.'));
+                                    if (rating >= 1 && rating <= 5) {
+                                        allRatings.push(rating);
+                                    }
+                                }
+                            });
+                            if (allRatings.length >= 3) break; // 找到足够的评分就停止
+                        }
+                    }
+                    
+                    // 策略2: 从CSS类名提取评分 (针对a-star-5这种格式)
+                    if (allRatings.length < 3) {
+                        const starElements = Array.from(document.querySelectorAll('i.a-icon-star, i[data-hook*="review-star-rating"], i[data-hook*="cmps-review-star-rating"]'));
+                        starElements.slice(0, 5).forEach(el => {
+                            if (allRatings.length >= 3) return;
+                            const className = el.className ? el.className.toString() : '';
+                            const classMatch = className.match(/a-star-(\d+(?:[,\.]\d+)?)/);
+                            if (classMatch) {
+                                const rating = parseFloat(classMatch[1].replace(',', '.'));
+                                if (rating >= 1 && rating <= 5) {
+                                    allRatings.push(rating);
+                                }
+                            }
+                        });
+                    }
+                    
+                    // 策略3: 基于评论容器的精确查找
+                    if (allRatings.length < 3) {
+                        const reviewContainers = Array.from(document.querySelectorAll('div[data-hook="review"], .review, .cr-original-review-text'));
+                        reviewContainers.slice(0, 3).forEach(container => {
+                            if (allRatings.length >= 3) return;
+                            // 优先使用测试验证有效的选择器
+                            const ratingSelectors = [
+                                'i[data-hook="cmps-review-star-rating"] span.a-icon-alt',
+                                'i.a-icon-star span.a-icon-alt',
+                                'i[data-hook="review-star-rating"] span.a-icon-alt'
+                            ];
+                            
+                            for (const selector of ratingSelectors) {
+                                const ratingEl = container.querySelector(selector);
+                                if (ratingEl) {
+                                    const text = ratingEl.textContent || '';
+                                    const match = text.match(/(\d+(?:[,\.]\d+)?)\s*(von|out\s*of)\s*5/i) || 
+                                                 text.match(/(\d+(?:[,\.]\d+)?)/);
+                                    if (match) {
+                                        const rating = parseFloat(match[1].replace(',', '.'));
+                                        if (rating >= 1 && rating <= 5) {
+                                            allRatings.push(rating);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    
+                    // 去重并计算平均值，保留一位小数
+                    const uniqueRatings = [...new Set(allRatings)].slice(0, 3);
+                    const average = uniqueRatings.length ? uniqueRatings.reduce((a,b)=>a+b,0)/uniqueRatings.length : 0;
+                    return Math.round(average * 10) / 10; // 保留一位小数
                 }''')
-                latest3_rating = round(avg_rating, 1)
+                latest3_rating = round(avg_rating, 1) if avg_rating > 0 else 0.0
+                if latest3_rating > 0:
+                    logging.info(f"[VINE] ASIN={asin} 成功获取评分: {latest3_rating} (使用优化后的多语言选择器)")
+                else:
+                    logging.warning(f"[VINE] ASIN={asin} 未能获取到有效评分，请检查页面结构")
             except Exception as rt_e:
                 logging.error(f"[VINE] ASIN={asin} rating calc error: {rt_e}")
+                latest3_rating = 0.0
 
     logging.info(f"[VINE] ASIN={asin} vine_count={vine_count}, latest3_rating={latest3_rating}")
     return vine_count, latest3_rating
