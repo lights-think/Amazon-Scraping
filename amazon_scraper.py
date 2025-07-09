@@ -103,7 +103,7 @@ async def extract_bsr_from_node(node):
     patterns_other = [
         r'#([0-9]+(?:\s+[0-9]{3})*)\s+i\s+([^(#]+?)(?:\s*\(|$)',  # 瑞典
         r'#([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',  # 荷兰/英文
-        r'(?:nº|n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+en\s+([^(#]+?)(?:\s*\(|$)',  # 西班牙
+        r'(?:nº|n°|No\.)\s*([0-9]+(?:[\.,][0-9]{3})*)\s+en\s+([^(#]+?)(?:\s*\(|$)',  # 西班牙(逗号或句号千位)
         r'(?:n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+dans\s+([^(#]+?)(?:\s*\(|$)',  # 法语
         r'(?:Nr\.|Rang\s+Nr\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+(?:in|bei)\s+([^(#]+?)(?:\s*\(|$)',  # 德语
         r'n\.\s*([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',  # 意大利
@@ -172,13 +172,13 @@ async def extract_bsr_from_node(node):
                 'Top 100 dei', 'Top 100 der', 'Top 100 de',
             ]
             text_stripped = text.strip()
-            # 1. 导航li判别：以导航短语开头或包含导航短语，直接跳过
-            # 增强：特别过滤掉排名为100的导航链接项
-            if (any(nav_phrase in text_stripped for nav_phrase in NAV_PHRASES) and 
-                (not re.search(r'[#nNoNr\d]', text_stripped) or 
-                 re.search(r'[#nNoNr\.\s]*100\s+in\s+', text_stripped, re.IGNORECASE))):
-                logging.info(f"[BSR-NAV-SKIP] 跳过导航链接: '{text_stripped}'")
-                continue
+            # 1. 导航li判别：仅当未包含有效排名或排名为100时跳过
+            if any(nav_phrase in text_stripped for nav_phrase in NAV_PHRASES):
+                m_rank = re.search(r'([0-9]+[\s,\.0-9]*)', text_stripped)
+                rank_candidate = m_rank.group(1).replace(',', '').replace('.', '').replace(' ', '') if m_rank else ''
+                if (not rank_candidate.isdigit()) or int(rank_candidate) == 100:
+                    logging.info(f"[BSR-NAV-SKIP] 跳过导航链接: '{text_stripped}'")
+                    continue
             # 2. 若li主文本为"#N in "，a标签文本为category，则category取a标签文本
             m = re.match(r'[#nNoNr\.\s]*(\d+[,.\d]*)\s+in\s*$', text_stripped, re.IGNORECASE)
             if m:
@@ -313,7 +313,7 @@ async def fetch_product_data(page, url):
                     patterns_other = [
                         r'#([0-9]+(?:\s+[0-9]{3})*)\s+i\s+([^(#]+?)(?:\s*\(|$)',  # 瑞典
                         r'#([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',  # 荷兰/英文
-                        r'(?:nº|n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+en\s+([^(#]+?)(?:\s*\(|$)',  # 西班牙
+                        r'(?:nº|n°|No\.)\s*([0-9]+(?:[\.,][0-9]{3})*)\s+en\s+([^(#]+?)(?:\s*\(|$)',  # 西班牙(逗号或句号千位)
                         r'(?:n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+dans\s+([^(#]+?)(?:\s*\(|$)',  # 法语
                         r'(?:Nr\.|Rang\s+Nr\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+(?:in|bei)\s+([^(#]+?)(?:\s*\(|$)',  # 德语
                         r'n\.\s*([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^(#]+?)(?:\s*\(|$)',  # 意大利
@@ -629,7 +629,7 @@ async def fetch_product_data(page, url):
                 text = re.sub(r'\s+', ' ', text).strip()
                 
                 # 西班牙格式: nº20.691 en Productos (句号分隔千位)
-                es_matches = re.findall(r'(?:nº|n°|No\.)\s*([0-9]+(?:\.[0-9]{3})*)\s+en\s+([^(#]+?)(?:\s*\(|$)', text, re.IGNORECASE)
+                es_matches = re.findall(r'(?:nº|n°|No\.)\s*([0-9]+(?:[\.,][0-9]{3})*)\s+en\s+([^(#]+?)(?:\s*\(|$)', text, re.IGNORECASE)
                 if es_matches and not main_rank:
                     main_rank = es_matches[0][0].replace('.', '')
                     main_category = es_matches[0][1].strip()
@@ -1216,7 +1216,7 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir, progress_c
         # 使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
         context = await pw.chromium.launch_persistent_context(
             profile_dir,
-            headless=False,
+            headless=True,
             executable_path=r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
             user_agent=DEFAULT_USER_AGENT,
             locale=target_locale,
@@ -1354,6 +1354,18 @@ def clean_and_adjust_categories(csv_path='output.csv'):
     df['bsr_main_category'] = df['bsr_main_category'].apply(clean_category_name)
     df['bsr_sub_category'] = df['bsr_sub_category'].apply(clean_category_name)
 
+    # 如果仅存在父类（子类为空），则把父类信息移动到子类列
+    mask = (
+        (df['bsr_sub_category'].isna() | (df['bsr_sub_category'] == '')) &
+        (df['bsr_sub_rank'].isna() | (df['bsr_sub_rank'] == '')) &
+        (df['bsr_main_category'].notna() & (df['bsr_main_category'] != '')) &
+        (df['bsr_main_rank'].notna() & (df['bsr_main_rank'] != ''))
+    )
+    df.loc[mask, 'bsr_sub_category'] = df.loc[mask, 'bsr_main_category']
+    df.loc[mask, 'bsr_sub_rank'] = df.loc[mask, 'bsr_main_rank']
+    df.loc[mask, 'bsr_main_category'] = ''
+    df.loc[mask, 'bsr_main_rank'] = ''
+
     # 父子类调整
     def adjust_row(row):
         # 检查主类/子类及排名是否缺失
@@ -1370,8 +1382,8 @@ def clean_and_adjust_categories(csv_path='output.csv'):
             sub_rank_num = int(str(sub_rank).replace(',', ''))
         except Exception:
             return row
-        # 如果主类排名大于子类排名，则交换
-        if main_rank_num > sub_rank_num:
+        # 如果主类排名小于子类排名，则交换（保证父类排名数值更大）
+        if main_rank_num < sub_rank_num:
             row['bsr_main_category'], row['bsr_sub_category'] = sub_cat, main_cat
             row['bsr_main_rank'], row['bsr_sub_rank'] = sub_rank, main_rank
         return row

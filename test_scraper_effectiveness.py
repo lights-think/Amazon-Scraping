@@ -30,6 +30,7 @@ def test_scraper_effectiveness(csv_file='output.csv', debug=False):
     invalid_reasons = {
         "父类子类只有一个": 0,
         "父子类名称一致": 0,
+        "子类排名为100": 0,
         "Rating缺失": 0,
         "Review Count缺失": 0
     }
@@ -46,6 +47,24 @@ def test_scraper_effectiveness(csv_file='output.csv', debug=False):
             print(f"\n检查行 {index+1} (ASIN: {row.get('ASIN', 'N/A')}):")
             print(f"  主类别: {row.get('bsr_main_category', 'N/A')}, 子类别: {row.get('bsr_sub_category', 'N/A')}")
             print(f"  评分: {row.get('rating', 'N/A')}, 评论数: {row.get('review_count', 'N/A')}")
+
+        # 新增规则：子类排名为100 视为缺数据
+        sub_rank_value = row.get('bsr_sub_rank', '')
+        is_sub_rank_100 = False
+        if pd.notna(sub_rank_value):
+            # 若能转换为数字并等于100，则视为100；否则检查字符串"100"
+            try:
+                if float(sub_rank_value) == 100:
+                    is_sub_rank_100 = True
+            except (ValueError, TypeError):
+                pass
+            if not is_sub_rank_100 and str(sub_rank_value).strip() == '100':
+                is_sub_rank_100 = True
+        if is_sub_rank_100:
+            missing_data_count += 1
+            invalid_reasons_for_row.append("子类排名为100")
+            if debug:
+                print("  ❌ 子类排名为100 (缺数据)")
         
         # 1. 如果父类子类只有一个，认定缺数据
         if (has_main_category and not has_sub_category) or (not has_main_category and has_sub_category):
@@ -85,8 +104,8 @@ def test_scraper_effectiveness(csv_file='output.csv', debug=False):
             valid_count += 1
             if debug:
                 print("  ✅ 有效数据")
-        elif "父类子类只有一个" in invalid_reasons_for_row and len(invalid_reasons_for_row) == 1:
-            # 如果只有"父类子类只有一个"这一个原因，则只计入缺数据，不计入无效数据
+        elif len(invalid_reasons_for_row) == 1 and invalid_reasons_for_row[0] in ["父类子类只有一个", "子类排名为100"]:
+            # 如果只有“父类子类只有一个”或“子类排名为100”这一个原因，则只计入缺数据，不计入无效数据
             if debug:
                 print("  ❓ 缺数据 (不计入无效)")
         else:

@@ -5,3 +5,4 @@ spider.log
 output.csv
 /my_browser_profile_*
 __pycache__
+/my_browser_profile
