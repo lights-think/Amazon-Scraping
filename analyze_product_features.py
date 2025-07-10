@@ -9,6 +9,141 @@ import logging
 import os
 import re  # 用于正则分割实现标准化
 
+# ========== 新增依赖说明 ==========
+# 需要: pip install ultralytics opencv-python scikit-learn
+from ultralytics import YOLO
+import cv2
+import tempfile
+import shutil
+from sklearn.cluster import KMeans
+import numpy as np
+from ollama import chat as ollama_chat
+
+# ========== YOLO辅助函数 ==========
+# 标准色RGB字典
+STANDARD_COLOR_RGB = {
+    "Black": (0, 0, 0),
+    "White": (255, 255, 255),
+    "Red": (220, 20, 60),
+    "Blue": (30, 144, 255),
+    "Green": (34, 139, 34),
+    "Yellow": (255, 215, 0),
+    "Orange": (255, 140, 0),
+    "Purple": (128, 0, 128),
+    "Pink": (255, 105, 180),
+    "Brown": (139, 69, 19),
+    "Gray": (128, 128, 128),
+    "Silver": (192, 192, 192),
+    "Gold": (255, 215, 0),
+    "Beige": (245, 245, 220),
+    "Multicolor": (127, 127, 127)
+}
+
+# 全局YOLO模型变量
+YOLO_MODEL = None
+
+def get_yolo_model():
+    global YOLO_MODEL
+    if YOLO_MODEL is None:
+        YOLO_MODEL = YOLO('yolov8s.pt')  # 使用最新小模型
+    return YOLO_MODEL
+
+def download_image(url):
+    try:
+        import requests
+        logger.info(f"开始下载图片: {url}")
+        resp = requests.get(url, timeout=10, stream=True)
+        if resp.status_code == 200:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+            with open(tmp.name, 'wb') as f:
+                shutil.copyfileobj(resp.raw, f)
+            logger.info(f"图片下载成功: {tmp.name}")
+            return tmp.name
+        else:
+            logger.warning(f"图片下载失败，状态码: {resp.status_code}, url: {url}")
+    except Exception as e:
+        logger.warning(f"图片下载失败: {url}, {e}")
+    return None
+
+def yolo_detect_main_object(image_path):
+    try:
+        logger.info(f"开始YOLO分析图片: {image_path}")
+        model = get_yolo_model()
+        results = model(image_path)
+        boxes = results[0].boxes.xyxy.cpu().numpy() if results and results[0].boxes is not None else []
+        confs = results[0].boxes.conf.cpu().numpy() if results and results[0].boxes is not None else []
+        clss = results[0].boxes.cls.cpu().numpy() if results and results[0].boxes is not None else []
+        img = cv2.imread(image_path)
+        if len(boxes) == 0:
+            logger.warning(f"YOLO未检测到任何目标: {image_path}")
+            # 用整图做主色和形状分析
+            if img is not None:
+                h, w = img.shape[:2]
+                box = [0, 0, w, h]
+                class_id = None
+                logger.info(f"用整图推断形状: box={box}")
+                return img, class_id, box
+            else:
+                logger.warning(f"cv2无法读取图片: {image_path}")
+                return None, None, None
+        # 取最大面积box
+        areas = [(b[2]-b[0])*(b[3]-b[1]) for b in boxes]
+        idx = int(np.argmax(areas))
+        box = boxes[idx]
+        class_id = int(clss[idx])
+        conf = confs[idx]
+        logger.info(f"YOLO检测到目标: class_id={class_id}, box={box}, conf={conf}")
+        if img is None:
+            logger.warning(f"cv2无法读取图片: {image_path}")
+            return None, None, None
+        x1, y1, x2, y2 = map(int, box)
+        crop = img[y1:y2, x1:x2]
+        return crop, class_id, box
+    except Exception as e:
+        logger.warning(f"YOLO识别失败: {image_path}, {e}")
+        return None, None, None
+
+def get_dominant_color(image, k=3):
+    try:
+        img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        img = img.reshape((-1, 3))
+        kmeans = KMeans(n_clusters=k, n_init=3, random_state=42).fit(img)
+        counts = np.bincount(kmeans.labels_)
+        dom_color = kmeans.cluster_centers_[np.argmax(counts)]
+        # 映射到标准色
+        min_dist, best_color = float('inf'), 'Multicolor'
+        for cname, rgb in STANDARD_COLOR_RGB.items():
+            dist = np.linalg.norm(dom_color - np.array(rgb))
+            if dist < min_dist:
+                min_dist, best_color = dist, cname
+        return best_color
+    except Exception as e:
+        logger.warning(f"主色识别失败: {e}")
+        return 'Unknown'
+
+YOLO_CYLINDRICAL_CLASSES = {39, 41, 46}  # 39:bottle, 41:cup, 46:can (COCO)
+YOLO_CYLINDRICAL_NAMES = {'bottle', 'cup', 'can'}
+
+def infer_shape_from_box(box, class_id):
+    # YOLO类别可用COCO80类，部分可推断形状
+    # box: [x1, y1, x2, y2]
+    # class_id: int or None
+    if class_id is not None:
+        # 优先类别判断
+        if class_id in YOLO_CYLINDRICAL_CLASSES:
+            return 'Cylindrical'
+    if box is None:
+        return 'Unknown'
+    w = box[2] - box[0]
+    h = box[3] - box[1]
+    ratio = w / h if h > 0 else 1
+    if 0.9 < ratio < 1.1:
+        return 'Square'
+    elif ratio >= 1.1 or ratio <= 0.8:
+        return 'Rectangular'
+    else:
+        return 'Unknown'
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -200,6 +335,45 @@ def create_prompt(title, bullet_points):
     
     return prompt
 
+def call_ollama_api(prompt, max_retries=3, retry_delay=2):
+    """
+    使用ollama本地API调用qwen3:latest模型，返回JSON格式特征，自动过滤思考过程。
+    """
+    import re
+    for attempt in range(max_retries):
+        try:
+            response = ollama_chat(model='qwen3:latest', messages=[{'role': 'user', 'content': prompt}])
+            content = response['message']['content'] if isinstance(response, dict) else response.message.content
+            # 只提取第一个JSON对象
+            json_match = re.search(r'\{[\s\S]*?\}', content)
+            if json_match:
+                json_str = json_match.group(0)
+                try:
+                    features = json.loads(json_str)
+                    # 确保返回的JSON包含所需字段
+                    if not all(key in features for key in ['color', 'material', 'shape']):
+                        default_keys = {'color': 'Unknown', 'material': 'Unknown', 'shape': 'Unknown'}
+                        for key in default_keys:
+                            if key not in features:
+                                features[key] = default_keys[key]
+                    logger.info(f"Ollama最终结果: {features}")
+                    return features
+                except json.JSONDecodeError:
+                    logger.warning(f"Ollama返回的JSON解析失败: {json_str}")
+                    if attempt == max_retries - 1:
+                        return {'color': 'Unknown', 'material': 'Unknown', 'shape': 'Unknown'}
+            else:
+                logger.warning(f"Ollama未返回JSON，原始内容: {content[:100]}...")
+                if attempt == max_retries - 1:
+                    return {'color': 'Unknown', 'material': 'Unknown', 'shape': 'Unknown'}
+        except Exception as e:
+            logger.warning(f"Ollama请求失败: {str(e)}")
+            if attempt == max_retries - 1:
+                return {'color': 'Unknown', 'material': 'Unknown', 'shape': 'Unknown'}
+        if attempt < max_retries - 1:
+            time.sleep(retry_delay)
+    return {'color': 'Unknown', 'material': 'Unknown', 'shape': 'Unknown'}
+
 @click.command()
 @click.option('--input', '-i', 'input_file', default='basic_info_output.csv', help='输入CSV文件路径，包含产品标题和描述')
 @click.option('--output', '-o', 'output_file', default='product_features.csv', help='输出CSV文件路径')
@@ -273,10 +447,40 @@ def main(input_file, output_file, batch_size, start_index, end_index):
                     material_val = standardize_material(raw_material)
                     shape_val = standardize_shape(raw_shape)
 
-                    # 如果仍有 Unknown 字段，再调用 AI 解析缺失部分
+                    # ========== 新增：如颜色非标准色或包含非颜色信息，直接用YOLO识别主色 ==========
+                    color_is_standard = color_val != "Unknown" and color_val.lower() in [c.lower() for c in STANDARD_COLORS]
+                    # 检查是否包含数字、单位、逗号、空格等非颜色信息
+                    import re
+                    color_has_noise = bool(re.search(r'\d|cm|mm|inch|x|\s|,|\.|-', color_val, re.IGNORECASE))
+                    if (not color_is_standard) or color_has_noise:
+                        color_val = "Unknown"
+
+                    # ========== YOLO识别主图主体颜色/形状 ==========
+                    if (color_val == "Unknown" or shape_val == "Unknown") and 'main_image' in row and isinstance(row['main_image'], str) and row['main_image'].startswith('http'):
+                        # 确保模型已加载（首次会自动下载）
+                        _ = get_yolo_model()
+                        img_path = download_image(row['main_image'])
+                        if img_path:
+                            crop, class_id, box = yolo_detect_main_object(img_path)
+                            if crop is not None:
+                                if color_val == "Unknown":
+                                    logger.info(f"YOLO主色分析: {img_path}")
+                                    color_val = get_dominant_color(crop)
+                                if shape_val == "Unknown":
+                                    logger.info(f"YOLO形状推断: {img_path}")
+                                    shape_val = infer_shape_from_box(box, class_id)
+                            else:
+                                logger.warning(f"YOLO未能识别出主主体，图片: {img_path}")
+                            try:
+                                os.remove(img_path)
+                                logger.info(f"已删除临时图片: {img_path}")
+                            except Exception as e:
+                                logger.warning(f"删除临时图片失败: {img_path}, {e}")
+
+                    # ========== AI兜底 ==========
                     if "Unknown" in [color_val, material_val, shape_val]:
                         prompt = create_prompt(title, bullet_points)
-                        features = call_groq_api(prompt)
+                        features = call_ollama_api(prompt)
                         if color_val == "Unknown":
                             color_val = standardize_color(features.get('color'))
                         if material_val == "Unknown":

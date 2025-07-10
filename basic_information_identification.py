@@ -43,12 +43,13 @@ DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
 
 async def extract_basic_information(page):
     """
-    从亚马逊页面提取基本信息：标题、五点描述和产品概览表格
+    从亚马逊页面提取基本信息：标题、五点描述和产品概览表格，并抓取主图链接
     """
     result = {
         'title': '',
         'bullet_points': [],
-        'product_overview': {}  # 新增产品概览字段
+        'product_overview': {},  # 新增产品概览字段
+        'main_image': ''         # 新增主图字段
     }
     
     # 提取标题
@@ -186,6 +187,28 @@ async def extract_basic_information(page):
     except Exception as e:
         logger.error(f"提取产品概览表格时出错: {str(e)}")
     
+    # 提取主图链接
+    try:
+        img_element = await page.query_selector('#landingImage')
+        if img_element:
+            src = await img_element.get_attribute('src')
+            if src:
+                result['main_image'] = src.strip()
+            else:
+                # 兜底：尝试data-old-hires属性
+                old_src = await img_element.get_attribute('data-old-hires')
+                if old_src:
+                    result['main_image'] = old_src.strip()
+        else:
+            # 兜底：尝试XPath
+            img_element = await page.query_selector('//img[@id="landingImage"]')
+            if img_element:
+                src = await img_element.get_attribute('src')
+                if src:
+                    result['main_image'] = src.strip()
+    except Exception as e:
+        logger.error(f"提取主图链接时出错: {str(e)}")
+    
     return result
 
 async def handle_continue_shopping(page):
@@ -270,7 +293,8 @@ async def fetch_product_data(page, url):
             'url': url,
             'title': basic_info['title'],
             'bullet_points': basic_info['bullet_points'],
-            'product_overview': basic_info['product_overview']  # 添加产品概览数据
+            'product_overview': basic_info['product_overview'],  # 添加产品概览数据
+            'main_image': basic_info['main_image'] # 添加主图链接
         }
     except Exception as e:
         logger.error(f"获取产品数据时出错: {str(e)}")
@@ -278,7 +302,8 @@ async def fetch_product_data(page, url):
             'url': url,
             'title': '',
             'bullet_points': [],
-            'product_overview': {}  # 添加空的产品概览字典
+            'product_overview': {},  # 添加空的产品概览字典
+            'main_image': '' # 添加空的主图链接
         }
 
 async def run_scraper(df, results_list_ref, concurrency, profile_dir):
@@ -453,6 +478,9 @@ def main(input_file, output_file, encoding, sep, concurrency, profile_template, 
                     lambda x: json.loads(x).get(field, '') if x and x != '{}' else ''
                 )
         
+        # 新增：确保main_image字段输出
+        if 'main_image' not in results_df.columns:
+            results_df['main_image'] = ''
         # 保存结果
         results_df.to_csv(abs_out_path, index=False, encoding='utf-8-sig')
         logger.info(f"已将结果保存到 {abs_out_path}")
