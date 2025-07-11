@@ -950,234 +950,9 @@ async def fetch_product_data(page, url):
     
     return main_category, main_rank, sub_category, sub_rank, rating, review_count
 
-async def fetch_vine_count(page, asin, domain):
-    """
-    获取所有评论数，计算最后三页并统计 Vine 评论数量
-    """
-    # 第一步：获取所有评论总数，用于计算页数
-    page_size = 10
-    first_url = f'https://www.{domain}/product-reviews/{asin}?sortBy=recent&reviewerType=all_reviews&formatType=all_formats&pageNumber=1&pageSize={page_size}'
-    logging.info(f"ASIN={asin} - Fetching initial page to get total review count: {first_url}")
-    await page.goto(first_url, timeout=60000, wait_until='domcontentloaded')
-    await page.wait_for_timeout(2000)
-    # 获取评论总数文本
-    try:
-        await page.wait_for_selector('#filter-info-section > div', timeout=15000)
-        count_text = (await page.inner_text('#filter-info-section > div')).strip()
-    except:
-        await page.wait_for_selector('div[data-hook="cr-filter-info-review-rating-count"]', timeout=5000)
-        count_text = (await page.inner_text('div[data-hook="cr-filter-info-review-rating-count"]')).strip()
-    m = re.search(r'([\d,]+)', count_text)
-    total_reviews = int(m.group(1).replace(',', '')) if m else 0
-    # 计算总页数及起始页（最后三页）
-    total_pages = max((total_reviews + page_size - 1) // page_size, 1)
-    # 限制最多抓取 10 页评论
-    total_pages = min(total_pages, 10)
 
-    # 初始化 Vine 评论计数和最后一页前三条评论平均评分
-    vine_count = 0
-    latest3_rating = 0.0  # 存储最后一页前三条评论的平均评分
-    previous_first_review_text = "INITIAL_DUMMY_VALUE_FOR_FIRST_PAGE_COMPARISON_DO_NOT_MATCH_REAL_TEXT" # Initialize
 
-    for page_num in range(1, total_pages + 1):
-        current_page_first_review_text_for_next_iteration = "" # Reset for current page
 
-        if page_num > 1: # Navigation and content change check needed for pages 2 onwards
-            try:
-                await page.click('li.a-last a')
-                url_pattern = re.compile(rf"(\?|&)pageNumber={page_num}(&|$)")
-                await page.wait_for_url(url_pattern, timeout=30000)
-                await page.wait_for_load_state('domcontentloaded', timeout=30000)
-                await page.wait_for_timeout(1000) # Fixed delay
-
-                # Explicitly wait for page content to change from the previous page
-                content_changed = False
-                for attempt in range(10): # Max 5 seconds wait for content to change
-                    new_page_first_el = await page.query_selector('span[data-hook="review-body"]:first-of-type')
-                    if new_page_first_el:
-                        new_page_first_text = await new_page_first_el.inner_text()
-                        if new_page_first_text.strip() and new_page_first_text != previous_first_review_text:
-                            logging.debug(f"ASIN={asin} - Content for page {page_num} confirmed different from previous page.")
-                            current_page_first_review_text_for_next_iteration = new_page_first_text
-                            content_changed = True
-                            break 
-                    await page.wait_for_timeout(500) # Wait 0.5s before retrying
-                
-                if not content_changed:
-                    logging.warning(f"ASIN={asin} - Timed out waiting for content of page {page_num} to differ from previous. Counts may be inaccurate. Previous: '{previous_first_review_text[:50]}...'")
-
-            except Exception as e_nav:
-                logging.error(f"ASIN={asin} - Error navigating to page {page_num} (click, URL, load state, fixed delay, or content change wait): {e_nav}")
-                break # Break from ASIN's page loop
-        
-        # Common section for all pages (page 1 and subsequent pages)
-        try:
-            await page.wait_for_selector('span[data-hook="review-body"]', timeout=6000)
-            
-            # For page 1, or if content change check above didn't capture text (e.g. first page after nav error, or genuinely no change)
-            if not current_page_first_review_text_for_next_iteration:
-                first_el_for_capture = await page.query_selector('span[data-hook="review-body"]:first-of-type')
-                if first_el_for_capture:
-                    current_page_first_review_text_for_next_iteration = await first_el_for_capture.inner_text()
-
-        except Exception as e_content:
-            logging.warning(f"ASIN={asin} - Review-body not found on page {page_num} (URL: {page.url}): {e_content}")
-            # Continue to JS eval, which might return 0 if content is missing
-
-        # Execute JS to count Vine reviews on the current page
-        try:
-            count = await page.evaluate('''() => {
-                const els = document.querySelectorAll('span.a-color-success.a-text-bold');
-                let cnt = 0;
-                els.forEach(el => {
-                    if (el.textContent.trim() === 'Amazon Vine Customer Review of Free Product') cnt++;
-                });
-                return cnt;
-            }''')
-            vine_count += count
-            logging.info(f"ASIN={asin} - Page {page_num} Vine reviews via click-nav JS: {count}")
-        except Exception as e_js:
-            logging.error(f"ASIN={asin} - Error on page {page_num} JS eval: {e_js}")
-
-        # 如果是最后一页，则计算前三条评论的平均评分
-        if page_num == total_pages:
-            try:
-                avg_rating = await page.evaluate(r'''() => {
-                    const stars = Array.from(document.querySelectorAll('i[data-hook="review-star-rating"] span.a-icon-alt'));
-                    const nums = stars.slice(0, 3).map(el => {
-                        const m = el.textContent.match(/(\d+(?:\.\d+)?)/);
-                        return m ? parseFloat(m[1]) : 0;
-                    });
-                    const valid = nums.filter(r => !isNaN(r));
-                    const sum = valid.reduce((a, b) => a + b, 0);
-                    return valid.length ? sum / valid.length : 0;
-                }''')
-                latest3_rating = round(avg_rating, 1)
-                logging.info(f"ASIN={asin} - Page {page_num} latest3 average rating: {latest3_rating}")
-            except Exception as e_rt:
-                logging.error(f"ASIN={asin} - Error calculating latest3_rating on page {page_num}: {e_rt}")
-
-        # Update previous_first_review_text for the next iteration
-        previous_first_review_text = current_page_first_review_text_for_next_iteration if current_page_first_review_text_for_next_iteration else previous_first_review_text
-
-    logging.info(f"ASIN={asin} - Total Vine reviews found: {vine_count}, latest3_rating: {latest3_rating}")
-    return vine_count, latest3_rating
-
-# 新增：Vine 评论独立抓取函数，使用登录会话
-async def run_vine_scraper(df, results_list_ref, concurrency, user_data_dir):
-    """
-    使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
-    """
-    # 使用默认英文环境，依赖精确的多语言BSR解析
-    target_locale = 'en-US'
-    target_timezone = 'America/New_York'
-    accept_language = 'en-US,en;q=0.9'
-    
-    logging.info(f"[Vine] 使用标准环境: {target_locale}, 时区: {target_timezone}")
-    
-    async with async_playwright() as pw:
-        # 使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
-        context = await pw.chromium.launch_persistent_context(
-            user_data_dir,
-            headless=False,
-            executable_path=r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-            user_agent=DEFAULT_USER_AGENT,
-            locale=target_locale,
-            timezone_id=target_timezone,
-            viewport={'width': 1920, 'height': 1080}
-        )
-        page = await context.new_page()
-        await page.set_extra_http_headers({
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Accept-Language": accept_language
-        })
-        # 初始化 Vine 评论抓取的进度条
-        pbar = tqdm(total=len(df), desc='Vine Scraping')
-        await page.set_extra_http_headers({
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Accept-Language": accept_language
-        })
-        # 登录状态已持久化，直接开始抓取 Vine 评论
-        for idx, row in enumerate(df.itertuples(index=False)):
-            asin = getattr(row, 'ASIN', '')
-            country = getattr(row, 'country', '').upper()
-            domain = DOMAIN_MAP.get(country, 'amazon.com')
-            # 获取 Vine 评论总数和最后一页前三条评论平均评分，并对单条异常进行捕获，避免批次中断
-            try:
-                vine_count, latest3_rating = await fetch_vine_count(page, asin, domain)
-                status = '成功'
-            except Exception as e_vine_one:
-                # 捕获单条异常，输出日志但不中断后续流程
-                logging.error(f"ASIN={asin} - Vine scraping error: {e_vine_one}")
-                vine_count, latest3_rating = 0, 0.0
-                status = '失败'
-
-            # 确保 results_list_ref 对应位置存在可写字典
-            if idx >= len(results_list_ref) or results_list_ref[idx] is None:
-                results_list_ref[idx] = {
-                    'ASIN': asin,
-                    'country': country
-                }
-
-            results_list_ref[idx]['vine_count'] = vine_count
-            results_list_ref[idx]['latest3_rating'] = latest3_rating
-
-            # 控制台输出爬取情况，同时写入日志
-            msg = f"[Vine] {asin} - {status}: count={vine_count}, rating={latest3_rating}"
-            print(msg)
-            if status == '成功':
-                logging.info(msg)
-            else:
-                logging.error(msg)
-            # 更新进度条
-            pbar.update(1)
-        # 完成后关闭进度条并关闭浏览器
-        pbar.close()
-        await context.close()
-
-# 新增：登录流程，通过任意VINE链接触发登录
-async def login_flow(profile_dir, login_url):
-    """
-    使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
-    """
-    # 使用默认英文环境，依赖精确的多语言BSR解析
-    target_locale = 'en-US'
-    target_timezone = 'America/New_York'
-    accept_language = 'en-US,en;q=0.9'
-    
-    logging.info(f"[Login] 使用标准环境: {target_locale}, 时区: {target_timezone}")
-    
-    async with async_playwright() as pw:
-        # 使用系统 Chrome，可复用登录态并固定 UA、视口、语言和时区
-        context = await pw.chromium.launch_persistent_context(
-            profile_dir,
-            headless=False,
-            executable_path=r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-            user_agent=DEFAULT_USER_AGENT,
-            locale=target_locale,
-            timezone_id=target_timezone,
-            viewport={'width': 1920, 'height': 1080}
-        )
-        page = await context.new_page()
-        await page.set_extra_http_headers({
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Accept-Language": accept_language
-        })
-        await page.goto(login_url)
-        input("请在浏览器中完成登录后按回车继续...")
-        # 会话预热：模拟人类行为，确保 Cookie 写入
-        # 访问产品页面
-        await page.goto(login_url.split('?')[0].replace('/product-reviews/', '/'), timeout=60000)
-        await page.wait_for_timeout(2000)
-        # 滚动页面
-        await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1000)
-        await page.evaluate("window.scrollBy(0, -document.body.scrollHeight)")
-        await page.wait_for_timeout(1000)
-        # 返回首页
-        await page.goto(f"https://{login_url.split('/')[2]}", timeout=60000)
-        await page.wait_for_timeout(2000)
-        await context.close()
 
 def ensure_login(profile_dir, df):
     """
@@ -1246,7 +1021,7 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir, progress_c
                     'ASIN': asin, 'country': country, 'url': url,
                     'bsr_main_category': '', 'bsr_main_rank': '',
                     'bsr_sub_category': '', 'bsr_sub_rank': '',
-                    'vine_count': 0, 'rating': '', 'review_count': ''
+                    'rating': '', 'review_count': ''
                 }
                 logging.info(f"开始抓取 ASIN={asin}, Country={country}, URL={url}")
 
@@ -1288,7 +1063,7 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir, progress_c
                 logging.info(
                     f"ASIN={asin} - Final Data: "
                     f"MainBSR: {main_rank}/{main_cat}, SubBSR: {sub_rank}/{sub_cat}, "
-                    f"Rating: {rating}, Reviews: {reviews}, Vine: {record['vine_count']}"
+                    f"Rating: {rating}, Reviews: {reviews}"
                 )
                 if not (main_rank and rating and reviews):
                      logging.warning(f"ASIN={asin} - Final check: Core product data might be incomplete.")
@@ -1577,6 +1352,7 @@ def main(input_file, output_file, encoding, sep, concurrency, profile_template, 
         logging.warning("未收集到任何有效数据。")
         return
 
+    # 保存结果
     out_df = pd.DataFrame(valid_results)
     abs_out_path = os.path.abspath(output_file)
     try:
@@ -1586,28 +1362,6 @@ def main(input_file, output_file, encoding, sep, concurrency, profile_template, 
     except Exception as e_save:
         print(f"错误: 无法保存结果到 '{abs_out_path}': {e_save}")
         logging.error(f"无法保存结果到 '{abs_out_path}': {e_save}")
-
-    # 再跑 Vine 抓取，使用指定的用户数据目录持久化登录信息
-    try:
-        asyncio.run(run_vine_scraper(df, results_data, concurrency, user_data_dir))
-    except Exception as e_vine:
-        logging.critical(f"运行 Vine 爬虫时发生未处理的严重错误: {e_vine}")
-        print(f"Vine 爬虫运行时发生严重错误: {e_vine}")
-        return
-    # 最终保存包括 Vine 的完整结果
-    final_df = pd.DataFrame(results_data)
-    abs_final_path = os.path.abspath(output_file)
-    try:
-        final_df.to_csv(abs_final_path, index=False, encoding='utf-8-sig')
-        if os.path.exists(abs_final_path):
-            print(f'完整数据已保存至 {abs_final_path}')
-            logging.info(f'完整数据已保存至 {abs_final_path}')
-        else:
-            print(f'警告: 尝试保存到 {abs_final_path} 但文件未找到，请检查写入权限。')
-            logging.warning(f'尝试保存到 {abs_final_path} 但文件未找到，请检查写入权限。')
-    except Exception as e_final:
-        print(f"错误: 无法保存完整结果到 '{abs_final_path}': {e_final}")
-        logging.error(f"无法保存完整结果到 '{abs_final_path}': {e_final}")
 
     # --- 新增：主流程后自动清洗和调整品类 ---
     clean_and_adjust_categories('output.csv')
