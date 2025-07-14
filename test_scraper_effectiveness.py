@@ -1,13 +1,14 @@
 import csv
 import pandas as pd
 
-def test_scraper_effectiveness(csv_file='output.csv', debug=False):
+def test_scraper_effectiveness(csv_file='./temp/all_info_raw.csv', debug=False):
     """
     测试爬虫有效性的脚本，根据以下规则：
     1. 如果父类子类只有一个，认定缺数据
     2. 两个都没有认定为有效
     3. 父子类名称一致，认定为无效
     4. Rating和review_count缺失认定无效
+    5. BSR父类或子类名称超过10个英文单词认定无效
     
     有效率大于80%认定爬虫可用
     """
@@ -32,7 +33,8 @@ def test_scraper_effectiveness(csv_file='output.csv', debug=False):
         "父子类名称一致": 0,
         "子类排名为100": 0,
         "Rating缺失": 0,
-        "Review Count缺失": 0
+        "Review Count缺失": 0,
+        "BSR类别名称过长": 0
     }
     
     # 逐行检查数据
@@ -93,6 +95,23 @@ def test_scraper_effectiveness(csv_file='output.csv', debug=False):
             invalid_reasons_for_row.append("Review Count缺失")
             if debug:
                 print("  ❌ Review Count缺失")
+        
+        # 5. 检查BSR父类或子类名称是否超过10个英文单词
+        def count_english_words(text):
+            """统计英文单词数量"""
+            if pd.isna(text) or text == '':
+                return 0
+            # 分割文本并过滤空字符串
+            words = [word.strip() for word in str(text).split() if word.strip()]
+            return len(words)
+        
+        main_category_words = count_english_words(row.get('bsr_main_category', ''))
+        sub_category_words = count_english_words(row.get('bsr_sub_category', ''))
+        
+        if main_category_words > 10 or sub_category_words > 10:
+            invalid_reasons_for_row.append("BSR类别名称过长")
+            if debug:
+                print(f"  ❌ BSR类别名称过长 (主类: {main_category_words}词, 子类: {sub_category_words}词)")
         
         # 统计无效原因
         for reason in invalid_reasons_for_row:
