@@ -8,6 +8,8 @@ import click
 import logging
 import os
 import re  # 用于正则分割实现标准化
+import multiprocessing
+from multiprocessing import Process, Manager, Queue, Value
 
 # ========== 新增依赖说明 ==========
 # 需要: pip install ultralytics opencv-python scikit-learn
@@ -374,13 +376,243 @@ def call_ollama_api(prompt, max_retries=3, retry_delay=2):
             time.sleep(retry_delay)
     return {'color': 'Unknown', 'material': 'Unknown', 'shape': 'Unknown'}
 
+def analyze_single_product(row_data, result_queue, progress_counter=None):
+    """
+    分析单个产品的特征（color, material, shape）
+    """
+    try:
+        asin = row_data.get('ASIN', 'Unknown')
+        title = str(row_data.get('title', '')) if not pd.isna(row_data.get('title')) else ""
+        bullet_points = str(row_data.get('bullet_points', '')) if not pd.isna(row_data.get('bullet_points')) else ""
+        product_overview_str = str(row_data.get('product_overview', '{}')) if not pd.isna(row_data.get('product_overview')) else "{}"
+        main_image = str(row_data.get('main_image', '')) if not pd.isna(row_data.get('main_image')) else ""
+
+        # 先从产品概览中提取原始值
+        raw_color = _extract_from_overview(product_overview_str, COLOR_KEYS)
+        raw_material = _extract_from_overview(product_overview_str, MATERIAL_KEYS)
+        raw_shape = _extract_from_overview(product_overview_str, SHAPE_KEYS)
+
+        # 标准化
+        color_val = standardize_color(raw_color)
+        material_val = standardize_material(raw_material)
+        shape_val = standardize_shape(raw_shape)
+
+        # 如颜色非标准色或包含非颜色信息，用YOLO识别主色
+        color_is_standard = color_val != "Unknown" and color_val.lower() in [c.lower() for c in STANDARD_COLORS]
+        color_has_noise = bool(re.search(r'\d|cm|mm|inch|x|\s|,|\.|-', color_val, re.IGNORECASE))
+        if (not color_is_standard) or color_has_noise:
+            color_val = "Unknown"
+
+        # YOLO识别主图主体颜色/形状
+        if (color_val == "Unknown" or shape_val == "Unknown") and main_image.startswith('http'):
+            try:
+                _ = get_yolo_model()  # 确保模型已加载
+                img_path = download_image(main_image)
+                if img_path:
+                    crop, class_id, box = yolo_detect_main_object(img_path)
+                    if crop is not None:
+                        if color_val == "Unknown":
+                            color_val = get_dominant_color(crop)
+                        if shape_val == "Unknown":
+                            shape_val = infer_shape_from_box(box, class_id)
+                    try:
+                        os.remove(img_path)
+                    except:
+                        pass
+            except Exception as e:
+                logger.warning(f"YOLO分析失败: {e}")
+
+        # AI兜底
+        if "Unknown" in [color_val, material_val, shape_val]:
+            prompt = create_prompt(title, bullet_points)
+            features = call_ollama_api(prompt)
+            if color_val == "Unknown":
+                color_val = standardize_color(features.get('color', 'Unknown'))
+            if material_val == "Unknown":
+                material_val = standardize_material(features.get('material', 'Unknown'))
+            if shape_val == "Unknown":
+                shape_val = standardize_shape(features.get('shape', 'Unknown'))
+
+        # 准备结果
+        result = {
+            'index': row_data.get('index'),
+            'color': color_val,
+            'material': material_val,
+            'shape': shape_val
+        }
+        
+        logger.info(f"完成分析 ASIN {asin}: 颜色={color_val}, 材质={material_val}, 形状={shape_val}")
+        
+        # 放入结果队列
+        result_queue.put(result)
+        
+        # 更新进度计数器
+        if progress_counter is not None:
+            try:
+                with progress_counter.get_lock():
+                    progress_counter.value += 1
+            except AttributeError:
+                progress_counter.value += 1
+                
+    except Exception as e:
+        logger.error(f"分析 ASIN {row_data.get('ASIN', 'Unknown')} 时出错: {str(e)}")
+        # 放入错误结果
+        result_queue.put({
+            'index': row_data.get('index'),
+            'color': 'Unknown',
+            'material': 'Unknown',
+            'shape': 'Unknown',
+            'ERROR': str(e)
+        })
+        
+        # 仍然更新进度计数器
+        if progress_counter is not None:
+            try:
+                with progress_counter.get_lock():
+                    progress_counter.value += 1
+            except AttributeError:
+                progress_counter.value += 1
+
+
+def analyze_worker_process(task_queue, result_queue, progress_counter, batch_size=5, sleep_time=1):
+    """分析特征的子进程执行函数"""
+    while True:
+        try:
+            # 从任务队列获取一批数据
+            batch_data = []
+            for _ in range(batch_size):
+                if task_queue.empty():
+                    break
+                item = task_queue.get()
+                if item is None:  # 结束信号
+                    task_queue.put(None)  # 放回结束信号给其他进程
+                    return
+                batch_data.append(item)
+            
+            if not batch_data:
+                # 队列为空，等待一会再试
+                time.sleep(0.1)
+                continue
+                
+            # 处理批次中的每个项目
+            for row_data in batch_data:
+                analyze_single_product(row_data, result_queue, progress_counter)
+                
+            # 批次间休息
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+                
+        except Exception as e:
+            logger.error(f"分析进程发生异常: {e}")
+            time.sleep(1)  # 出错后休息一下再继续
+
+
+def analyze_features_multiprocess(df, analyze_processes=2, analyze_batch_size=10, analyze_sleep=2):
+    """
+    多进程分析产品特征（color, material, shape）
+    """
+    if df.empty:
+        logger.info("没有需要分析的产品")
+        return df
+        
+    logger.info(f"开始多进程分析 {len(df)} 个产品的特征，进程数={analyze_processes}")
+    
+    # 添加索引列以便后续更新
+    df = df.reset_index(drop=False)
+    
+    # 创建共享对象
+    manager = Manager()
+    task_queue = manager.Queue()
+    result_queue = manager.Queue()
+    progress_counter = manager.Value('i', 0)
+    
+    # 将所有任务放入队列
+    for _, row in df.iterrows():
+        task_queue.put(row.to_dict())
+    
+    # 添加结束信号
+    task_queue.put(None)
+    
+    # 启动分析进程
+    processes = []
+    for i in range(analyze_processes):
+        p = Process(target=analyze_worker_process, 
+                   args=(task_queue, result_queue, progress_counter, analyze_batch_size, analyze_sleep))
+        p.daemon = True
+        p.start()
+        processes.append(p)
+        logger.info(f"启动分析子进程 {p.pid}")
+    
+    # 显示总进度
+    total_items = len(df)
+    pbar = tqdm(total=total_items, desc='特征分析进度')
+    
+    # 收集结果
+    results = []
+    completed = 0
+    
+    while completed < total_items:
+        # 更新进度条
+        try:
+            with progress_counter.get_lock():
+                current = progress_counter.value
+        except AttributeError:
+            current = progress_counter.value
+            
+        pbar.update(current - pbar.n)
+        
+        # 收集已完成的结果
+        while not result_queue.empty():
+            result = result_queue.get()
+            results.append(result)
+            completed += 1
+            
+        # 检查是否所有进程都还活着
+        if not any(p.is_alive() for p in processes) and completed < total_items:
+            logger.error("所有分析进程都已结束，但任务未完成")
+            break
+            
+        time.sleep(0.5)
+    
+    # 最终更新进度条
+    pbar.update(total_items - pbar.n)
+    pbar.close()
+    
+    # 等待所有进程结束
+    for p in processes:
+        p.join(timeout=1)
+        if p.is_alive():
+            p.terminate()
+    
+    logger.info(f"分析阶段完成，收集了 {len(results)} 条结果")
+    
+    # 更新原始DataFrame
+    for result in results:
+        if 'index' in result and result['index'] in df.index:
+            idx = result['index']
+            if 'color' in result:
+                df.at[idx, 'color'] = result['color']
+            if 'material' in result:
+                df.at[idx, 'material'] = result['material']
+            if 'shape' in result:
+                df.at[idx, 'shape'] = result['shape']
+    
+    # 删除临时索引列
+    if 'index' in df.columns:
+        df = df.drop('index', axis=1)
+        
+    return df
+
 @click.command()
-@click.option('--input', '-i', 'input_file', default='basic_info_output.csv', help='输入CSV文件路径，包含产品标题和描述')
-@click.option('--output', '-o', 'output_file', default='product_features.csv', help='输出CSV文件路径')
+@click.option('--input', '-i', 'input_file', default='temp/spider_raw_output.csv', help='输入CSV文件路径，包含产品原始数据')
+@click.option('--output', '-o', 'output_file', default='temp/product_features_analyzed.csv', help='输出CSV文件路径')
 @click.option('--batch-size', '-b', 'batch_size', default=10, type=int, help='每次处理的批次大小')
 @click.option('--start-index', '-s', 'start_index', default=0, type=int, help='开始处理的索引位置')
 @click.option('--end-index', '-e', 'end_index', default=-1, type=int, help='结束处理的索引位置，-1表示处理到末尾')
-def main(input_file, output_file, batch_size, start_index, end_index):
+@click.option('--processes', '-p', 'processes', default=2, type=int, help='分析进程数')
+@click.option('--sleep-time', '-t', 'sleep_time', default=2, type=int, help='批次间隔秒数')
+@click.option('--use-multiprocess', '-m', 'use_multiprocess', is_flag=True, help='使用多进程并行分析')
+def main(input_file, output_file, batch_size, start_index, end_index, processes, sleep_time, use_multiprocess):
     """分析产品特征并提取颜色、材质和形状"""
     try:
         # 读取输入文件
@@ -391,12 +623,19 @@ def main(input_file, output_file, batch_size, start_index, end_index):
         df = pd.read_csv(input_file)
         logger.info(f"成功读取输入文件: {input_file}, 共 {len(df)} 条记录")
         
-        # 检查必要的列
+        # 检查必要的列（兼容all_in_one_spider.py的输出格式）
         required_columns = ['ASIN', 'country', 'title', 'bullet_points']
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
             logger.error(f"输入文件缺少必要的列: {', '.join(missing_columns)}")
             return
+        
+        # 确保可选列存在（这些列可能来自all_in_one_spider.py）
+        optional_columns = ['product_overview', 'main_image']
+        for col in optional_columns:
+            if col not in df.columns:
+                df[col] = ''
+                logger.info(f"添加缺失的可选列: {col}")
         
         # 处理索引范围
         if end_index == -1 or end_index >= len(df):
@@ -407,114 +646,132 @@ def main(input_file, output_file, batch_size, start_index, end_index):
         total = len(df_to_process)
         logger.info(f"将处理 {total} 条记录，从索引 {start_index} 到 {end_index-1}")
         
-        # 创建结果列
-        df_to_process['color'] = 'Unknown'
-        df_to_process['material'] = 'Unknown'
-        df_to_process['shape'] = 'Unknown'
+        # 检查哪些记录需要分析
+        for col in ['color', 'material', 'shape']:
+            if col not in df_to_process.columns:
+                df_to_process[col] = 'Unknown'
         
-        # 批量处理记录
-        for i in tqdm(range(0, total, batch_size), desc="处理批次"):
-            batch = df_to_process.iloc[i:min(i+batch_size, total)]
+        # 筛选需要分析的记录
+        needs_analysis = df_to_process[
+            df_to_process['color'].isna() | 
+            df_to_process['material'].isna() | 
+            df_to_process['shape'].isna() |
+            (df_to_process['color'] == '') |
+            (df_to_process['material'] == '') |
+            (df_to_process['shape'] == '') |
+            (df_to_process['color'] == 'Unknown') |
+            (df_to_process['material'] == 'Unknown') |
+            (df_to_process['shape'] == 'Unknown')
+        ].copy()
+        
+        if needs_analysis.empty:
+            logger.info("所有记录都已完成特征分析")
+        else:
+            logger.info(f"发现 {len(needs_analysis)} 条记录需要特征分析")
             
-            for idx, row in batch.iterrows():
-                try:
-                    title = str(row['title']) if not pd.isna(row['title']) else ""
-                    bullet_points = str(row['bullet_points']) if not pd.isna(row['bullet_points']) else ""
+            if use_multiprocess and len(needs_analysis) > 5:
+                # 使用多进程分析
+                logger.info(f"启动多进程分析，进程数: {processes}")
+                analyzed_df = analyze_features_multiprocess(
+                    needs_analysis, 
+                    analyze_processes=processes,
+                    analyze_batch_size=batch_size, 
+                    analyze_sleep=sleep_time
+                )
+                
+                # 更新原始DataFrame
+                for idx, row in analyzed_df.iterrows():
+                    if idx in df_to_process.index:
+                        df_to_process.at[idx, 'color'] = row['color']
+                        df_to_process.at[idx, 'material'] = row['material']
+                        df_to_process.at[idx, 'shape'] = row['shape']
+            else:
+                # 使用单进程批量分析
+                logger.info("使用单进程批量分析")
+                for i in tqdm(range(0, len(needs_analysis), batch_size), desc="处理批次"):
+                    batch = needs_analysis.iloc[i:min(i+batch_size, len(needs_analysis))]
+                    
+                    for idx, row in batch.iterrows():
+                        try:
+                            title = str(row['title']) if not pd.isna(row['title']) else ""
+                            bullet_points = str(row['bullet_points']) if not pd.isna(row['bullet_points']) else ""
+                            product_overview_str = str(row.get('product_overview', '{}')) if not pd.isna(row.get('product_overview')) else "{}"
+                            main_image = str(row.get('main_image', '')) if not pd.isna(row.get('main_image')) else ""
 
-                    # ---------------- 先从 overview_* 或 JSON 中提取原始值 ----------------
-                    raw_color = None
-                    raw_material = None
-                    raw_shape = None
+                            # 先从产品概览中提取原始值
+                            raw_color = _extract_from_overview(product_overview_str, COLOR_KEYS)
+                            raw_material = _extract_from_overview(product_overview_str, MATERIAL_KEYS)
+                            raw_shape = _extract_from_overview(product_overview_str, SHAPE_KEYS)
 
-                    # 1) 直接列
-                    if 'overview_color' in df_to_process.columns and not pd.isna(row['overview_color']):
-                        raw_color = str(row['overview_color']).strip()
-                    if 'overview_material' in df_to_process.columns and not pd.isna(row['overview_material']):
-                        raw_material = str(row['overview_material']).strip()
-                    if 'overview_shape' in df_to_process.columns and not pd.isna(row['overview_shape']):
-                        raw_shape = str(row['overview_shape']).strip()
+                            # 标准化
+                            color_val = standardize_color(raw_color)
+                            material_val = standardize_material(raw_material)
+                            shape_val = standardize_shape(raw_shape)
 
-                    # 2) product_overview JSON
-                    if (raw_color is None or raw_color == "") and 'product_overview' in row:
-                        raw_color = _extract_from_overview(row['product_overview'], COLOR_KEYS)
-                    if (raw_material is None or raw_material == "") and 'product_overview' in row:
-                        raw_material = _extract_from_overview(row['product_overview'], MATERIAL_KEYS)
-                    if (raw_shape is None or raw_shape == "") and 'product_overview' in row:
-                        raw_shape = _extract_from_overview(row['product_overview'], SHAPE_KEYS)
+                            # 如颜色非标准色或包含非颜色信息，用YOLO识别主色
+                            color_is_standard = color_val != "Unknown" and color_val.lower() in [c.lower() for c in STANDARD_COLORS]
+                            color_has_noise = bool(re.search(r'\d|cm|mm|inch|x|\s|,|\.|-', color_val, re.IGNORECASE))
+                            if (not color_is_standard) or color_has_noise:
+                                color_val = "Unknown"
 
-                    # ---------------- 标准化 ----------------
-                    color_val = standardize_color(raw_color)
-                    material_val = standardize_material(raw_material)
-                    shape_val = standardize_shape(raw_shape)
+                            # YOLO识别主图主体颜色/形状
+                            if (color_val == "Unknown" or shape_val == "Unknown") and main_image.startswith('http'):
+                                try:
+                                    _ = get_yolo_model()
+                                    img_path = download_image(main_image)
+                                    if img_path:
+                                        crop, class_id, box = yolo_detect_main_object(img_path)
+                                        if crop is not None:
+                                            if color_val == "Unknown":
+                                                logger.info(f"YOLO主色分析: {img_path}")
+                                                color_val = get_dominant_color(crop)
+                                            if shape_val == "Unknown":
+                                                logger.info(f"YOLO形状推断: {img_path}")
+                                                shape_val = infer_shape_from_box(box, class_id)
+                                        try:
+                                            os.remove(img_path)
+                                        except:
+                                            pass
+                                except Exception as e:
+                                    logger.warning(f"YOLO分析失败: {e}")
 
-                    # ========== 新增：如颜色非标准色或包含非颜色信息，直接用YOLO识别主色 ==========
-                    color_is_standard = color_val != "Unknown" and color_val.lower() in [c.lower() for c in STANDARD_COLORS]
-                    # 检查是否包含数字、单位、逗号、空格等非颜色信息
-                    import re
-                    color_has_noise = bool(re.search(r'\d|cm|mm|inch|x|\s|,|\.|-', color_val, re.IGNORECASE))
-                    if (not color_is_standard) or color_has_noise:
-                        color_val = "Unknown"
-
-                    # ========== YOLO识别主图主体颜色/形状 ==========
-                    if (color_val == "Unknown" or shape_val == "Unknown") and 'main_image' in row and isinstance(row['main_image'], str) and row['main_image'].startswith('http'):
-                        # 确保模型已加载（首次会自动下载）
-                        _ = get_yolo_model()
-                        img_path = download_image(row['main_image'])
-                        if img_path:
-                            crop, class_id, box = yolo_detect_main_object(img_path)
-                            if crop is not None:
+                            # AI兜底
+                            if "Unknown" in [color_val, material_val, shape_val]:
+                                prompt = create_prompt(title, bullet_points)
+                                features = call_ollama_api(prompt)
                                 if color_val == "Unknown":
-                                    logger.info(f"YOLO主色分析: {img_path}")
-                                    color_val = get_dominant_color(crop)
+                                    color_val = standardize_color(features.get('color'))
+                                if material_val == "Unknown":
+                                    material_val = standardize_material(features.get('material'))
                                 if shape_val == "Unknown":
-                                    logger.info(f"YOLO形状推断: {img_path}")
-                                    shape_val = infer_shape_from_box(box, class_id)
-                            else:
-                                logger.warning(f"YOLO未能识别出主主体，图片: {img_path}")
-                            try:
-                                os.remove(img_path)
-                                logger.info(f"已删除临时图片: {img_path}")
-                            except Exception as e:
-                                logger.warning(f"删除临时图片失败: {img_path}, {e}")
+                                    shape_val = standardize_shape(features.get('shape'))
 
-                    # ========== AI兜底 ==========
-                    if "Unknown" in [color_val, material_val, shape_val]:
-                        prompt = create_prompt(title, bullet_points)
-                        features = call_ollama_api(prompt)
-                        if color_val == "Unknown":
-                            color_val = standardize_color(features.get('color'))
-                        if material_val == "Unknown":
-                            material_val = standardize_material(features.get('material'))
-                        if shape_val == "Unknown":
-                            shape_val = standardize_shape(features.get('shape'))
+                            # 更新DataFrame
+                            df_to_process.at[idx, 'color'] = color_val
+                            df_to_process.at[idx, 'material'] = material_val
+                            df_to_process.at[idx, 'shape'] = shape_val
 
-                    # 更新DataFrame
-                    df_to_process.at[idx, 'color'] = color_val
-                    df_to_process.at[idx, 'material'] = material_val
-                    df_to_process.at[idx, 'shape'] = shape_val
-
-                    logger.info(
-                        f"成功处理 ASIN {row['ASIN']}: 颜色={color_val}, 材质={material_val}, 形状={shape_val}"
-                    )
+                            logger.info(f"成功处理 ASIN {row['ASIN']}: 颜色={color_val}, 材质={material_val}, 形状={shape_val}")
+                            
+                            # 添加随机延时，限制请求速度
+                            sleep_time_random = random.uniform(1, 3)
+                            time.sleep(sleep_time_random)
+                            
+                        except Exception as e:
+                            logger.error(f"处理 ASIN {row.get('ASIN', 'Unknown')} 时出错: {str(e)}")
+                            df_to_process.at[idx, 'color'] = 'Unknown'
+                            df_to_process.at[idx, 'material'] = 'Unknown'
+                            df_to_process.at[idx, 'shape'] = 'Unknown'
                     
-                    # 添加随机延时，限制请求速度
-                    sleep_time = random.uniform(1, 3)
-                    logger.info(f"请求限速，等待 {sleep_time:.2f} 秒...")
-                    time.sleep(sleep_time)
-                    
-                except Exception as e:
-                    logger.error(f"处理 ASIN {row.get('ASIN', 'Unknown')} 时出错: {str(e)}")
-            
-            # 每批次保存一次，防止中断丢失数据
-            temp_output = f"{os.path.splitext(output_file)[0]}_temp.csv"
-            df_to_process.to_csv(temp_output, index=False, encoding='utf-8-sig')
-            logger.info(f"已处理 {min(i+batch_size, total)}/{total} 条记录，临时保存到 {temp_output}")
+                    # 批次间休息
+                    if i + batch_size < len(needs_analysis):
+                        logger.info(f"批次间休息 {sleep_time} 秒...")
+                        time.sleep(sleep_time)
         
         # 如果是处理全部数据，直接保存为最终输出
         if start_index == 0 and end_index == len(df):
-            # 只保留需要的列
-            result_df = df_to_process[['ASIN', 'country', 'color', 'material', 'shape']]
-            result_df.to_csv(output_file, index=False, encoding='utf-8-sig')
+            output_df = df_to_process.copy()
+            output_df.to_csv(output_file, index=False, encoding='utf-8-sig')
             logger.info(f"已将结果保存到 {output_file}")
         else:
             # 如果是部分处理，需要合并结果
@@ -529,22 +786,19 @@ def main(input_file, output_file, batch_size, start_index, end_index):
                         existing_df.loc[mask, ['color', 'material', 'shape']] = row[['color', 'material', 'shape']].values
                     else:
                         # 添加新记录
-                        new_row = row[['ASIN', 'country', 'color', 'material', 'shape']]
+                        new_row = row
                         existing_df = pd.concat([existing_df, pd.DataFrame([new_row])], ignore_index=True)
                 
                 existing_df.to_csv(output_file, index=False, encoding='utf-8-sig')
             else:
                 # 如果输出文件不存在，直接保存处理的部分
-                result_df = df_to_process[['ASIN', 'country', 'color', 'material', 'shape']]
-                result_df.to_csv(output_file, index=False, encoding='utf-8-sig')
+                df_to_process.to_csv(output_file, index=False, encoding='utf-8-sig')
             
             logger.info(f"已将结果合并保存到 {output_file}")
         
-        # 删除临时文件
-        temp_output = f"{os.path.splitext(output_file)[0]}_temp.csv"
-        if os.path.exists(temp_output):
-            os.remove(temp_output)
-            logger.info(f"已删除临时文件 {temp_output}")
+        print(f"=== 特征分析完成！结果已保存到 {os.path.abspath(output_file)} ===")
+        print(f"共处理 {len(df_to_process)} 条记录")
+        logger.info(f"特征分析任务完成，结果保存到 {os.path.abspath(output_file)}")
     
     except Exception as e:
         logger.error(f"主程序出错: {str(e)}")

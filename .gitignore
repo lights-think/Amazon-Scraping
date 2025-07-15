@@ -8,3 +8,5 @@ __pycache__
 /my_browser_profile
 *.pt
 /temp
+/data
+

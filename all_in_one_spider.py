@@ -34,13 +34,6 @@ from amazon_scraper import (
     DOMAIN_MAP, DEFAULT_USER_AGENT, extract_bsr_from_node
 )
 from basic_information_identification import extract_basic_information
-from analyze_product_features import (
-    call_ollama_api, create_prompt, standardize_color, 
-    standardize_material, standardize_shape, _extract_from_overview,
-    COLOR_KEYS, MATERIAL_KEYS, SHAPE_KEYS, STANDARD_COLORS,
-    get_yolo_model, download_image, yolo_detect_main_object,
-    get_dominant_color, infer_shape_from_box
-)
 
 
 def create_random_profile_dir(base_dir="temp/profiles"):
@@ -495,318 +488,6 @@ def bsr_update_worker_process(df_batch, profile_change_interval, concurrency, sh
         logger.error(f"[BSR-Worker] 发生异常: {e}")
 
 
-def analyze_single_product(row_data, result_queue, progress_counter=None):
-    """
-    分析单个产品的特征（color, material, shape）
-    """
-    try:
-        asin = row_data.get('ASIN', 'Unknown')
-        title = str(row_data.get('title', '')) if not pd.isna(row_data.get('title')) else ""
-        bullet_points = str(row_data.get('bullet_points', '')) if not pd.isna(row_data.get('bullet_points')) else ""
-        product_overview_str = str(row_data.get('product_overview', '{}')) if not pd.isna(row_data.get('product_overview')) else "{}"
-        main_image = str(row_data.get('main_image', '')) if not pd.isna(row_data.get('main_image')) else ""
-
-        # 先从产品概览中提取原始值
-        raw_color = _extract_from_overview(product_overview_str, COLOR_KEYS)
-        raw_material = _extract_from_overview(product_overview_str, MATERIAL_KEYS)
-        raw_shape = _extract_from_overview(product_overview_str, SHAPE_KEYS)
-
-        # 标准化
-        color_val = standardize_color(raw_color)
-        material_val = standardize_material(raw_material)
-        shape_val = standardize_shape(raw_shape)
-
-        # 如颜色非标准色或包含非颜色信息，用YOLO识别主色
-        color_is_standard = color_val != "Unknown" and color_val.lower() in [c.lower() for c in STANDARD_COLORS]
-        color_has_noise = bool(re.search(r'\d|cm|mm|inch|x|\s|,|\.|-', color_val, re.IGNORECASE))
-        if (not color_is_standard) or color_has_noise:
-            color_val = "Unknown"
-
-        # YOLO识别主图主体颜色/形状
-        if (color_val == "Unknown" or shape_val == "Unknown") and main_image.startswith('http'):
-            try:
-                _ = get_yolo_model()  # 确保模型已加载
-                img_path = download_image(main_image)
-                if img_path:
-                    crop, class_id, box = yolo_detect_main_object(img_path)
-                    if crop is not None:
-                        if color_val == "Unknown":
-                            color_val = get_dominant_color(crop)
-                        if shape_val == "Unknown":
-                            shape_val = infer_shape_from_box(box, class_id)
-                    try:
-                        os.remove(img_path)
-                    except:
-                        pass
-            except Exception as e:
-                logger.warning(f"YOLO分析失败: {e}")
-
-        # AI兜底
-        if "Unknown" in [color_val, material_val, shape_val]:
-            prompt = create_prompt(title, bullet_points)
-            features = call_ollama_api(prompt)
-            if color_val == "Unknown":
-                color_val = standardize_color(features.get('color', 'Unknown'))
-            if material_val == "Unknown":
-                material_val = standardize_material(features.get('material', 'Unknown'))
-            if shape_val == "Unknown":
-                shape_val = standardize_shape(features.get('shape', 'Unknown'))
-
-        # 准备结果
-        result = {
-            'index': row_data.get('index'),
-            'color': color_val,
-            'material': material_val,
-            'shape': shape_val
-        }
-        
-        logger.info(f"完成分析 ASIN {asin}: 颜色={color_val}, 材质={material_val}, 形状={shape_val}")
-        
-        # 放入结果队列
-        result_queue.put(result)
-        
-        # 更新进度计数器
-        if progress_counter is not None:
-            try:
-                with progress_counter.get_lock():
-                    progress_counter.value += 1
-            except AttributeError:
-                progress_counter.value += 1
-                
-    except Exception as e:
-        logger.error(f"分析 ASIN {row_data.get('ASIN', 'Unknown')} 时出错: {str(e)}")
-        # 放入错误结果
-        result_queue.put({
-            'index': row_data.get('index'),
-            'color': 'Unknown',
-            'material': 'Unknown',
-            'shape': 'Unknown',
-            'ERROR': str(e)
-        })
-        
-        # 仍然更新进度计数器
-        if progress_counter is not None:
-            try:
-                with progress_counter.get_lock():
-                    progress_counter.value += 1
-            except AttributeError:
-                progress_counter.value += 1
-
-
-def analyze_worker_process(task_queue, result_queue, progress_counter, batch_size=5, sleep_time=1):
-    """分析特征的子进程执行函数"""
-    while True:
-        try:
-            # 从任务队列获取一批数据
-            batch_data = []
-            for _ in range(batch_size):
-                if task_queue.empty():
-                    break
-                item = task_queue.get()
-                if item is None:  # 结束信号
-                    task_queue.put(None)  # 放回结束信号给其他进程
-                    return
-                batch_data.append(item)
-            
-            if not batch_data:
-                # 队列为空，等待一会再试
-                time.sleep(0.1)
-                continue
-                
-            # 处理批次中的每个项目
-            for row_data in batch_data:
-                analyze_single_product(row_data, result_queue, progress_counter)
-                
-            # 批次间休息
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-                
-        except Exception as e:
-            logger.error(f"分析进程发生异常: {e}")
-            time.sleep(1)  # 出错后休息一下再继续
-
-
-def analyze_features_multiprocess(df, analyze_processes=2, analyze_batch_size=10, analyze_sleep=2):
-    """
-    多进程分析产品特征（color, material, shape）
-    """
-    if df.empty:
-        logger.info("没有需要分析的产品")
-        return df
-        
-    logger.info(f"开始多进程分析 {len(df)} 个产品的特征，进程数={analyze_processes}")
-    
-    # 添加索引列以便后续更新
-    df = df.reset_index(drop=False)
-    
-    # 创建共享对象
-    manager = Manager()
-    task_queue = manager.Queue()
-    result_queue = manager.Queue()
-    progress_counter = manager.Value('i', 0)
-    
-    # 将所有任务放入队列
-    for _, row in df.iterrows():
-        task_queue.put(row.to_dict())
-    
-    # 添加结束信号
-    task_queue.put(None)
-    
-    # 启动分析进程
-    processes = []
-    for i in range(analyze_processes):
-        p = Process(target=analyze_worker_process, 
-                   args=(task_queue, result_queue, progress_counter, analyze_batch_size, analyze_sleep))
-        p.daemon = True
-        p.start()
-        processes.append(p)
-        logger.info(f"启动分析子进程 {p.pid}")
-    
-    # 显示总进度
-    total_items = len(df)
-    pbar = tqdm(total=total_items, desc='特征分析进度')
-    
-    # 收集结果
-    results = []
-    completed = 0
-    
-    while completed < total_items:
-        # 更新进度条
-        try:
-            with progress_counter.get_lock():
-                current = progress_counter.value
-        except AttributeError:
-            current = progress_counter.value
-            
-        pbar.update(current - pbar.n)
-        
-        # 收集已完成的结果
-        while not result_queue.empty():
-            result = result_queue.get()
-            results.append(result)
-            completed += 1
-            
-        # 检查是否所有进程都还活着
-        if not any(p.is_alive() for p in processes) and completed < total_items:
-            logger.error("所有分析进程都已结束，但任务未完成")
-            break
-            
-        time.sleep(0.5)
-    
-    # 最终更新进度条
-    pbar.update(total_items - pbar.n)
-    pbar.close()
-    
-    # 等待所有进程结束
-    for p in processes:
-        p.join(timeout=1)
-        if p.is_alive():
-            p.terminate()
-    
-    logger.info(f"分析阶段完成，收集了 {len(results)} 条结果")
-    
-    # 更新原始DataFrame
-    for result in results:
-        if 'index' in result and result['index'] in df.index:
-            idx = result['index']
-            if 'color' in result:
-                df.at[idx, 'color'] = result['color']
-            if 'material' in result:
-                df.at[idx, 'material'] = result['material']
-            if 'shape' in result:
-                df.at[idx, 'shape'] = result['shape']
-    
-    # 删除临时索引列
-    if 'index' in df.columns:
-        df = df.drop('index', axis=1)
-        
-    return df
-
-
-def analyze_features_batch(df_batch, batch_size=10, sleep_time=2):
-    """
-    批量分析产品特征（color, material, shape）- 单进程版本，保留用于兼容
-    """
-    logger.info(f"开始分析 {len(df_batch)} 个产品的特征")
-    
-    for i in tqdm(range(0, len(df_batch), batch_size), desc="分析特征"):
-        batch = df_batch.iloc[i:min(i+batch_size, len(df_batch))]
-        
-        for idx, row in batch.iterrows():
-            try:
-                title = str(row.get('title', '')) if not pd.isna(row.get('title')) else ""
-                bullet_points = str(row.get('bullet_points', '')) if not pd.isna(row.get('bullet_points')) else ""
-                product_overview_str = str(row.get('product_overview', '{}')) if not pd.isna(row.get('product_overview')) else "{}"
-                main_image = str(row.get('main_image', '')) if not pd.isna(row.get('main_image')) else ""
-
-                # 先从产品概览中提取原始值
-                raw_color = _extract_from_overview(product_overview_str, COLOR_KEYS)
-                raw_material = _extract_from_overview(product_overview_str, MATERIAL_KEYS)
-                raw_shape = _extract_from_overview(product_overview_str, SHAPE_KEYS)
-
-                # 标准化
-                color_val = standardize_color(raw_color)
-                material_val = standardize_material(raw_material)
-                shape_val = standardize_shape(raw_shape)
-
-                # 如颜色非标准色或包含非颜色信息，用YOLO识别主色
-                color_is_standard = color_val != "Unknown" and color_val.lower() in [c.lower() for c in STANDARD_COLORS]
-                color_has_noise = bool(re.search(r'\d|cm|mm|inch|x|\s|,|\.|-', color_val, re.IGNORECASE))
-                if (not color_is_standard) or color_has_noise:
-                    color_val = "Unknown"
-
-                # YOLO识别主图主体颜色/形状
-                if (color_val == "Unknown" or shape_val == "Unknown") and main_image.startswith('http'):
-                    try:
-                        _ = get_yolo_model()  # 确保模型已加载
-                        img_path = download_image(main_image)
-                        if img_path:
-                            crop, class_id, box = yolo_detect_main_object(img_path)
-                            if crop is not None:
-                                if color_val == "Unknown":
-                                    color_val = get_dominant_color(crop)
-                                if shape_val == "Unknown":
-                                    shape_val = infer_shape_from_box(box, class_id)
-                            try:
-                                os.remove(img_path)
-                            except:
-                                pass
-                    except Exception as e:
-                        logger.warning(f"YOLO分析失败: {e}")
-
-                # AI兜底
-                if "Unknown" in [color_val, material_val, shape_val]:
-                    prompt = create_prompt(title, bullet_points)
-                    features = call_ollama_api(prompt)
-                    if color_val == "Unknown":
-                        color_val = standardize_color(features.get('color', 'Unknown'))
-                    if material_val == "Unknown":
-                        material_val = standardize_material(features.get('material', 'Unknown'))
-                    if shape_val == "Unknown":
-                        shape_val = standardize_shape(features.get('shape', 'Unknown'))
-
-                # 更新DataFrame
-                df_batch.at[idx, 'color'] = color_val
-                df_batch.at[idx, 'material'] = material_val
-                df_batch.at[idx, 'shape'] = shape_val
-
-                logger.info(f"完成分析 ASIN {row.get('ASIN')}: 颜色={color_val}, 材质={material_val}, 形状={shape_val}")
-                
-            except Exception as e:
-                logger.error(f"分析 ASIN {row.get('ASIN', 'Unknown')} 时出错: {str(e)}")
-                # 设置默认值
-                df_batch.at[idx, 'color'] = 'Unknown'
-                df_batch.at[idx, 'material'] = 'Unknown'
-                df_batch.at[idx, 'shape'] = 'Unknown'
-        
-        # 批次间休息
-        if i + batch_size < len(df_batch):
-            logger.info(f"批次间休息 {sleep_time} 秒...")
-            time.sleep(sleep_time)
-    
-    return df_batch
-
-
 def load_completed_asins(temp_file):
     """加载已完成的ASIN列表"""
     if os.path.exists(temp_file):
@@ -1004,19 +685,16 @@ def update_bsr_mode(df, input_file, processes, concurrency, profile_change_inter
 @click.option('--batch-size', '-b', 'batch_size', default=50, type=int, help='每批处理多少个ASIN')
 @click.option('--sleep-time', '-t', 'sleep_time', default=5, type=int, help='批次间隔秒数')
 @click.option('--processes', '-p', 'processes', default=2, type=int, help='爬虫进程数')
-@click.option('--analyze-processes', '-a', 'analyze_processes', default=2, type=int, help='分析进程数')
 @click.option('--concurrency', '-c', 'concurrency', default=3, type=int, help='每进程协程数')
 @click.option('--profile-template', 'profile_template', default='temp/browser_profile_', help='浏览器用户数据目录前缀（已弃用，使用随机目录）')
 @click.option('--profile-change-interval', '-r', 'profile_change_interval', default=100, type=int, help='多少个请求后更换临时用户资料目录（反爬机制）')
-@click.option('--output', '-o', 'output_file', default='temp/all_info_output.csv', help='最终输出CSV文件路径')
-@click.option('--analyze-batch-size', 'analyze_batch_size', default=10, type=int, help='分析时每批大小')
-@click.option('--analyze-sleep', 'analyze_sleep', default=2, type=int, help='分析批次间隔秒数')
-@click.option('--update-bsr', '-u', 'update_bsr', is_flag=True, help='仅更新源文件中BSR品类为空的记录，跳过特征提取')
-def main(input_file, encoding, sep, batch_size, sleep_time, processes, analyze_processes, concurrency, 
-         profile_template, profile_change_interval, output_file, analyze_batch_size, analyze_sleep, update_bsr):
+@click.option('--output', '-o', 'output_file', default='temp/spider_raw_output.csv', help='爬虫原始数据输出CSV文件路径')
+@click.option('--update-bsr', '-u', 'update_bsr', is_flag=True, help='仅更新源文件中BSR品类为空的记录')
+def main(input_file, encoding, sep, batch_size, sleep_time, processes, concurrency, 
+         profile_template, profile_change_interval, output_file, update_bsr):
     """
-    一次性爬取Amazon产品的所有信息，包括BSR、评分、评论数、Vine、标题、描述等，
-    然后使用YOLO+AI分析产品特征
+    Amazon产品信息爬虫，专门负责抓取产品的原始数据
+    包括BSR、评分、评论数、标题、描述、产品概览、主图等
     
     使用随机临时用户资料目录反爬机制，每处理指定数量的请求后自动更换新的临时目录
     """
@@ -1186,48 +864,12 @@ def main(input_file, encoding, sep, batch_size, sleep_time, processes, analyze_p
     # 如果是BSR更新模式，跳过特征分析阶段
     if update_bsr:
         logger.info("BSR更新模式：跳过特征分析阶段")
-    else:
-        # 4. 多进程分析阶段
-        logger.info("=== 开始多进程分析阶段 ===")
-        
-        # 检查哪些需要分析（先确保列存在）
-        for col in ['color', 'material', 'shape']:
-            if col not in final_df.columns:
-                final_df[col] = ''
-        
-        analysis_needed = final_df[
-            final_df['color'].isna() | 
-            final_df['material'].isna() | 
-            final_df['shape'].isna() |
-            (final_df['color'] == '') |
-            (final_df['material'] == '') |
-            (final_df['shape'] == '')
-        ].copy()
-        
-        if not analysis_needed.empty:
-            logger.info(f"需要分析 {len(analysis_needed)} 个产品的特征")
-            # 使用多进程分析
-            analyzed_df = analyze_features_multiprocess(
-                analysis_needed, 
-                analyze_processes=analyze_processes,
-                analyze_batch_size=analyze_batch_size, 
-                analyze_sleep=analyze_sleep
-            )
-            
-            # 更新final_df
-            for idx, row in analyzed_df.iterrows():
-                if idx in final_df.index:
-                    final_df.at[idx, 'color'] = row['color']
-                    final_df.at[idx, 'material'] = row['material']
-                    final_df.at[idx, 'shape'] = row['shape']
-        else:
-            logger.info("所有产品都已完成特征分析")
     
-    # 5. 输出最终结果
+    # 输出爬虫原始数据结果
     # 确保列顺序
     output_columns = [
-        'ASIN', 'country', 'url', 'color', 'material', 'shape', 'title', 
-        'bullet_points', 'product_overview', 'bsr_main_category', 'bsr_main_rank', 
+        'ASIN', 'country', 'url', 'title', 
+        'bullet_points', 'product_overview', 'main_image', 'bsr_main_category', 'bsr_main_rank', 
         'bsr_sub_category', 'bsr_sub_rank', 'vine_count', 'rating', 'review_count', 
         'latest3_rating'
     ]
@@ -1240,13 +882,14 @@ def main(input_file, encoding, sep, batch_size, sleep_time, processes, analyze_p
     # 选择并重新排序列
     output_df = final_df[output_columns].copy()
     
-    # 保存最终结果
+    # 保存爬虫原始数据
     abs_output_path = os.path.abspath(output_file)
     output_df.to_csv(abs_output_path, index=False, encoding='utf-8-sig')
     
-    print(f"=== 完成！最终结果已保存到 {abs_output_path} ===")
-    print(f"共处理 {len(output_df)} 条记录")
-    logger.info(f"所有任务完成，最终结果保存到 {abs_output_path}")
+    print(f"=== 爬虫完成！原始数据已保存到 {abs_output_path} ===")
+    print(f"共抓取 {len(output_df)} 条记录")
+    print(f"如需分析产品特征，请运行: python analyze_product_features.py -i {abs_output_path}")
+    logger.info(f"爬虫任务完成，原始数据保存到 {abs_output_path}")
 
 
 if __name__ == '__main__':

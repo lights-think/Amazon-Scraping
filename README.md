@@ -1,220 +1,276 @@
-# Amazon 商品信息爬虫
+# Amazon供应链爬虫系统
 
-基于 Python 和 Playwright 的亚马逊商品信息爬虫，支持从 CSV/Excel 导入 ASIN 和国家，分为两个独立模块：
+一个完整的Amazon产品数据爬取和特征分析系统，现已分为两个独立的阶段：
 
-1. **主爬虫 (amazon_scraper.py)** - 抓取商品基本信息、BSR排名、评分和评论数
-2. **VINE爬虫 (VINE_Sccrape.py)** - 专门抓取商品的VINE评论数量和最近评论评分
-3. **一体化主控 (all_in_one_spider.py)** - 一次性完成爬取 + YOLO/AI 分析 + 断点续爬，产出最终17列结果
+1. **数据爬取阶段**：使用 `all_in_one_spider.py` 抓取Amazon产品原始数据
+2. **特征分析阶段**：使用 `analyze_product_features.py` 分析产品特征
 
-## 特性
+## 系统架构
 
-### 共同特性
-- 支持无头/可视化运行 Chrome
-- 命令行界面（CLI）
-- 进度条显示（tqdm）
-- CSV/Excel 输入/输出
-- 支持多进程并行抓取
-- 支持主流国家：US、UK、DE、FR、ES、IT、CA、JP、MX、IN、NL、SE、BE、IE、AU、BR、SG等
-
-### 主爬虫功能
-- 抓取商品BSR排名（主类和子类）
-- 抓取商品评分和评论数
-- 自动处理多语言网站
-- 支持多进程并行抓取
-
-### VINE爬虫功能
-- 专注抓取VINE评论数量
-- 计算最近评论的平均评分
-- 支持多国家登录状态管理
-- 支持仅登录模式
-
-## 安装
-
-1. 克隆仓库或下载脚本
-
-```bash
-git clone https://github.com/lights-think/Amazon-Scraping.git
-cd Amazon-Scraping
+```
+输入文件 (ASIN+Country)
+    ↓
+🕷️ all_in_one_spider.py (爬虫阶段)
+    ↓ 
+原始数据 (title, bullet_points, images, BSR等)
+    ↓
+🧠 analyze_product_features.py (分析阶段)
+    ↓
+最终结果 (color, material, shape)
 ```
 
-2. 安装依赖
+## 主要功能
+
+### 第一阶段：数据爬取 (`all_in_one_spider.py`)
+- ✅ 多进程并发爬取Amazon产品数据
+- ✅ 动态用户资料目录切换（反爬机制）
+- ✅ 断点续爬功能
+- ✅ BSR单独更新模式
+- ✅ 抓取内容：标题、描述、图片、BSR、评分、评论数等
+
+### 第二阶段：特征分析 (`analyze_product_features.py`)
+- ✅ 多进程特征分析
+- ✅ YOLO图像识别（颜色/形状）
+- ✅ AI语言模型分析（Ollama + qwen3）
+- ✅ 标准化特征映射
+- ✅ 增量分析支持
+
+## 快速开始
+
+### 1. 环境准备
 
 ```bash
+# 安装Python依赖
 pip install -r requirements.txt
+
+# 安装YOLO模型依赖
+pip install ultralytics opencv-python scikit-learn
+
+# 安装并启动Ollama (本地AI模型)
+# 访问 https://ollama.ai/ 下载安装
+ollama pull qwen3:latest
 ```
 
-3. 安装 Playwright 浏览器组件
+### 2. 准备输入文件
 
-```bash
-playwright install
-```
+创建包含ASIN和country的CSV文件：
 
-> 注意：脚本默认使用系统 Chrome，可执行路径为 Windows: `C:\Program Files\Google\Chrome\Application\chrome.exe`，如安装路径不同，请修改脚本中 `executable_path` 参数。
-
-## 使用方法
-
-### 主爬虫 (amazon_scraper.py)
-
-```bash
-# 基本用法
-python amazon_scraper.py -i input.csv -o output.csv
-
-# 高级参数
-python amazon_scraper.py -i input.csv -o output.csv -e utf-8 -s '\t' -c 3 -p my_browser_profile
-
-# 多进程模式
-python amazon_scraper.py -i input.csv -o output.csv --profile-template my_profile_ --profile-count 4
-```
-
-参数说明:
-- `-i/--input`: 输入文件路径 (CSV或Excel)
-- `-o/--output`: 输出文件路径 (CSV)
-- `-e/--encoding`: 输入CSV文件编码 (默认 utf-8-sig)
-- `-s/--sep`: 输入CSV分隔符 (默认 ,)
-- `-c/--concurrency`: 单进程内协程并发数 (默认 3)
-- `-p/--profile-dir`: 单进程模式用户数据目录 (默认 my_browser_profile)
-- `--profile-template`: 多进程模式用户数据目录前缀
-- `--profile-count`: 多进程数量 (>0时启用多进程)
-
-输出字段:
-- `ASIN`: 商品ASIN
-- `country`: 国家代码
-- `url`: 商品URL
-- `bsr_main_category`: 主分类名称
-- `bsr_main_rank`: 主分类排名
-- `bsr_sub_category`: 子分类名称
-- `bsr_sub_rank`: 子分类排名
-- `rating`: 平均评分
-- `review_count`: 评论数量
-
-### VINE爬虫 (VINE_Sccrape.py)
-
-```bash
-# 基本用法
-python VINE_Sccrape.py -i input.csv -o vine_output.csv
-
-# 仅登录模式
-python VINE_Sccrape.py -i input.csv --login-only
-
-# 强制重新登录
-python VINE_Sccrape.py -i input.csv -o vine_output.csv --force-login
-
-# 多进程模式
-python VINE_Sccrape.py -i input.csv -o vine_output.csv --profile-template vine_profile_ --profile-count 4
-```
-
-参数说明:
-- `-i/--input`: 输入文件路径 (CSV或Excel)
-- `-o/--output`: 输出文件路径 (CSV)
-- `-e/--encoding`: 输入CSV文件编码 (默认 utf-8-sig)
-- `-s/--sep`: 输入CSV分隔符 (默认 ,)
-- `-c/--concurrency`: 单进程内协程并发数 (默认 3)
-- `-p/--profile-dir`: 单进程模式用户数据目录 (默认 my_browser_profile)
-- `--profile-template`: 多进程模式用户数据目录前缀
-- `--profile-count`: 多进程数量 (>0时启用多进程)
-- `--force-login`: 强制重新登录所有国家
-- `--login-only`: 仅执行登录流程，不进行爬取
-
-输出字段:
-- `ASIN`: 商品ASIN
-- `country`: 国家代码
-- `vine_count`: VINE评论数量
-- `latest3_rating`: 最近3条评论的平均评分
-
-## 一体化主控脚本 (all_in_one_spider.py)
-`all_in_one_spider.py` 集成了 **爬虫 → YOLO 图片分析 → AI 文本分析 → CSV 合并输出** 的完整流程，支持多进程 + 多协程，并内置断点续爬。
-
-### 主要特性
-- **一次执行**：读取 ASIN+国家列表，自动完成所有信息抓取及特征分析。
-- **断点续爬**：中途中断后重新运行会跳过已处理记录（依据 `temp/all_info_raw.csv`）。
-- **多进程+协程**：`--processes` 控制进程数，`--concurrency` 控制每进程协程数。
-- **YOLO+AI**：先用 YOLO 识别主图颜色/形状，再用 AI(ollama) 补全缺失信息。
-- **可配置批次**：`--batch-size / --sleep-time` 控制单批 ASIN 数及批间间隔，降低反爬风险。
-
-### 命令行示例
-```bash
-# 快速测试（单进程）
-python all_in_one_spider.py -i input.csv -o result.csv --processes 1 --batch-size 20
-
-# 生产示例（多进程）
-python all_in_one_spider.py \
-  -i input.csv -o result.csv \
-  --processes 4 --concurrency 3 \
-  --batch-size 100 --sleep-time 8 \
-  --analyze-batch-size 20 --analyze-sleep 3
-```
-常用参数：
-| 参数 | 说明 | 默认 |
-|------|------|------|
-| `-i/--input` | 输入文件 (CSV/Excel)，需含 ASIN 和 country | `data/test_input.csv` |
-| `-o/--output` | 最终输出 CSV | `temp/all_info_output.csv` |
-| `--processes` | 进程数 | 2 |
-| `--concurrency` | 每进程协程数 | 3 |
-| `--batch-size` | 每批 ASIN 数 | 50 |
-| `--sleep-time` | 批间休眠秒数 | 5 |
-| `--analyze-batch-size` | AI 分析批大小 | 10 |
-| `--analyze-sleep` | 分析批间休眠秒数 | 2 |
-
-### 断点续爬说明
-- 爬虫阶段完成后，原始数据将写入 `temp/all_info_raw.csv`。
-- 再次运行脚本会自动读取该文件并跳过已完成的 `(ASIN,country)` 组合。
-- 如需强制重爬某条，可手动删除 `temp/all_info_raw.csv` 或在其中删除对应行。
-
-### 最终输出字段（17 列）
-| 列名 | 含义 |
-|------|------|
-| ASIN | 产品 ASIN |
-| country | 国家代码 |
-| url | 产品链接 |
-| color | 颜色 (标准化) |
-| material | 材质 (标准化) |
-| shape | 形状 (标准化) |
-| title | 产品标题 |
-| bullet_points | 五点描述 (多行换行分隔) |
-| product_overview | 产品概览(JSON) |
-| bsr_main_category | 主类名称 |
-| bsr_main_rank | 主类排名 |
-| bsr_sub_category | 子类名称 |
-| bsr_sub_rank | 子类排名 |
-| vine_count | Vine 评论数 |
-| rating | 平均评分 |
-| review_count | 评论数 |
-| latest3_rating | 最近3条评论平均评分 |
-
-> **依赖**：除 `requirements.txt` 外，还需安装 YOLO (`ultralytics`)、`opencv-python`、`ollama` 等，可参考 `requirements_all_in_one.txt`。
-
-## 输入文件格式
-
-输入文件 (CSV或Excel) 必须包含以下列:
-- `ASIN`: 商品ASIN编码
-- `country`: 国家代码 (如US, UK, DE等)
-
-示例:
-```
+```csv
 ASIN,country
-B07PXGQC1Q,US
-B08F2YD1GM,UK
-B07ZGLLWBT,DE
+B08N5WRWNW,US
+B07ZPKN6YR,UK
+B09JQCZJQZ,DE
 ```
 
-## 登录流程
+### 3. 完整流程执行
 
-首次运行VINE爬虫时，系统会打开浏览器窗口引导您登录Amazon账户。登录成功后，状态将被保存在用户数据目录中，后续运行无需重复登录。
+```bash
+# 方法1：使用示例脚本（推荐）
+python run_example.py
 
-使用`--force-login`参数可强制重新登录，`--login-only`参数可只执行登录而不进行爬取。
+# 方法2：手动执行两个阶段
+# 第一阶段：爬取数据
+python all_in_one_spider.py --input data/test_input.csv --output temp/spider_raw.csv --processes 2
 
-## 定期启动
-
-可以使用系统定时任务（如 `cron`）定期运行：
-
-```cron
-# 每天凌晨2点运行主爬虫
-0 2 * * * cd /path/to/repo && /usr/bin/python3 amazon_scraper.py -i input.csv -o output.csv
-
-# 每天凌晨3点运行VINE爬虫
-0 3 * * * cd /path/to/repo && /usr/bin/python3 VINE_Sccrape.py -i input.csv -o vine_output.csv
+# 第二阶段：分析特征
+python analyze_product_features.py --input temp/spider_raw.csv --output temp/final_result.csv --use-multiprocess
 ```
 
-## 开源协议
+## 详细使用说明
 
-本项目基于 MIT 协议开源，详细见 [LICENSE](LICENSE)。 
+### 爬虫阶段 (all_in_one_spider.py)
+
+#### 基本用法
+```bash
+python all_in_one_spider.py --input data/test_input.csv --output temp/spider_output.csv
+```
+
+#### 高级配置
+```bash
+python all_in_one_spider.py \
+    --input data/test_input.csv \
+    --output temp/spider_output.csv \
+    --processes 3 \
+    --concurrency 5 \
+    --profile-change-interval 50 \
+    --batch-size 20
+```
+
+#### BSR更新模式
+```bash
+# 只更新BSR信息为空的记录
+python all_in_one_spider.py --input existing_data.csv --update-bsr
+```
+
+#### 参数说明
+- `--input, -i`: 输入CSV文件路径
+- `--output, -o`: 输出CSV文件路径
+- `--processes, -p`: 爬虫进程数 (默认2)
+- `--concurrency, -c`: 每进程协程数 (默认3)
+- `--profile-change-interval, -r`: 反爬机制切换间隔 (默认100)
+- `--update-bsr, -u`: BSR更新模式
+
+### 分析阶段 (analyze_product_features.py)
+
+#### 基本用法
+```bash
+python analyze_product_features.py --input temp/spider_output.csv --output temp/analyzed.csv
+```
+
+#### 多进程分析
+```bash
+python analyze_product_features.py \
+    --input temp/spider_output.csv \
+    --output temp/analyzed.csv \
+    --use-multiprocess \
+    --processes 4 \
+    --batch-size 15
+```
+
+#### 部分数据处理
+```bash
+# 只处理第100-200条记录
+python analyze_product_features.py \
+    --input temp/spider_output.csv \
+    --output temp/analyzed_partial.csv \
+    --start-index 100 \
+    --end-index 200
+```
+
+#### 参数说明
+- `--input, -i`: 输入CSV文件路径
+- `--output, -o`: 输出CSV文件路径
+- `--use-multiprocess, -m`: 启用多进程分析
+- `--processes, -p`: 分析进程数 (默认2)
+- `--batch-size, -b`: 批次大小 (默认10)
+- `--sleep-time, -t`: 批次间隔 (默认2秒)
+- `--start-index, -s`: 开始索引 (默认0)
+- `--end-index, -e`: 结束索引 (默认-1，处理到末尾)
+
+## 输出格式
+
+### 爬虫阶段输出
+```csv
+ASIN,country,url,title,bullet_points,product_overview,main_image,bsr_main_category,bsr_main_rank,bsr_sub_category,bsr_sub_rank,vine_count,rating,review_count,latest3_rating
+```
+
+### 分析阶段输出
+在爬虫输出基础上添加：
+```csv
+color,material,shape
+```
+
+## 特征分析原理
+
+### 1. 数据源优先级
+1. **产品概览提取**：从`product_overview` JSON中提取现有特征
+2. **YOLO图像识别**：分析`main_image`识别颜色和形状
+3. **AI语言分析**：使用Ollama分析标题和描述
+
+### 2. 标准化映射
+- **颜色**：映射到15种标准颜色
+- **材质**：映射到15种标准材质
+- **形状**：映射到10种标准形状
+
+### 3. 智能过滤
+- 自动过滤非颜色信息（尺寸、型号等）
+- 检测和纠正低质量特征提取
+
+## 性能优化
+
+### 爬虫优化
+- **多进程并发**：每个进程独立的浏览器实例
+- **协程池**：每进程内多个页面并发
+- **动态代理**：定期切换用户资料目录
+- **断点续爬**：自动跳过已完成的记录
+
+### 分析优化
+- **多进程分析**：CPU密集型任务并行化
+- **增量处理**：只分析缺失特征的记录
+- **批量处理**：减少AI API调用开销
+- **缓存机制**：避免重复分析
+
+## 监控和日志
+
+### 日志文件
+- `temp/all_in_one_spider.log`: 爬虫详细日志
+- `temp/analyze_features.log`: 分析详细日志
+
+### 进度监控
+- 实时进度条显示
+- 详细的成功/失败统计
+- 性能指标记录
+
+## 故障排除
+
+### 常见问题
+
+1. **Chrome浏览器路径问题**
+   ```bash
+   # 修改 all_in_one_spider.py 中的路径
+   executable_path=r"你的Chrome路径"
+   ```
+
+2. **Ollama连接失败**
+   ```bash
+   # 确保Ollama服务运行
+   ollama serve
+   ollama pull qwen3:latest
+   ```
+
+3. **内存不足**
+   ```bash
+   # 减少并发数
+   --processes 1 --concurrency 2
+   ```
+
+4. **网络超时**
+   ```bash
+   # 增加反爬间隔
+   --profile-change-interval 50
+   ```
+
+### 调试模式
+```bash
+# 启用详细日志
+export PYTHONPATH=.
+python -u all_in_one_spider.py --input data/test_input.csv --processes 1
+```
+
+## 扩展功能
+
+### 自定义特征分析
+可以修改 `analyze_product_features.py` 中的标准化列表：
+- `STANDARD_COLORS`
+- `STANDARD_MATERIALS` 
+- `STANDARD_SHAPES`
+
+### 自定义AI提示
+修改 `create_prompt()` 函数来自定义AI分析逻辑。
+
+### 新数据源集成
+在 `analyze_single_product()` 函数中添加新的特征提取逻辑。
+
+## 贡献指南
+
+1. Fork项目
+2. 创建功能分支
+3. 提交更改
+4. 推送到分支
+5. 创建Pull Request
+
+## 许可证
+
+MIT License
+
+## 更新日志
+
+### v2.0.0 (当前版本)
+- 🔄 分离爬虫和分析功能
+- ✨ 增加多进程特征分析
+- 🎯 改进YOLO图像识别
+- 📊 增强数据兼容性
+- 🚀 优化性能和稳定性
+
+### v1.0.0
+- 🎉 初始版本，一体化爬虫和分析 
