@@ -102,8 +102,8 @@ async def extract_basic_information(page):
         # 尝试使用CSS选择器获取产品概览表格
         overview_table = await page.query_selector("#productOverview_feature_div > div > table > tbody")
         if not overview_table:
-            # 尝试使用XPath获取产品概览表格
-            overview_table = await page.query_selector("/html/body/div[1]/div/div/div[4]/div[4]/div[45]/div/table/tbody")
+            # 尝试使用XPath获取产品概览表格（修复选择器语法）
+            overview_table = await page.query_selector("xpath=//table[@id='productOverview']//tbody | //div[contains(@id,'productOverview')]//tbody | //table[contains(@class,'prodDetTable')]//tbody")
             
         if overview_table:
             # 获取所有行

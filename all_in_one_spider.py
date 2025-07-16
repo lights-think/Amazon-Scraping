@@ -11,9 +11,6 @@ import json
 import time
 import multiprocessing
 from multiprocessing import Process, Manager, Queue, Value
-import tempfile
-import shutil
-import uuid
 
 # 创建temp目录
 os.makedirs('temp', exist_ok=True)
@@ -36,73 +33,7 @@ from amazon_scraper import (
 from basic_information_identification import extract_basic_information
 
 
-def create_random_profile_dir(base_dir="temp/profiles"):
-    """
-    创建随机的临时用户资料目录
-    """
-    os.makedirs(base_dir, exist_ok=True)
-    random_id = str(uuid.uuid4())[:8]
-    profile_dir = os.path.join(base_dir, f"profile_{random_id}")
-    return profile_dir
 
-
-def cleanup_profile_dir(profile_dir):
-    """
-    清理临时用户资料目录
-    """
-    try:
-        if os.path.exists(profile_dir):
-            shutil.rmtree(profile_dir)
-            logger.info(f"已清理临时目录: {profile_dir}")
-    except Exception as e:
-        logger.warning(f"清理临时目录失败 {profile_dir}: {e}")
-
-
-class ProfileManager:
-    """
-    用户资料目录管理器，实现定期更换临时目录的反爬机制
-    """
-    def __init__(self, change_interval=100, base_dir="temp/profiles"):
-        self.change_interval = change_interval  # 多少个请求后更换目录
-        self.base_dir = base_dir
-        self.current_profile = None
-        self.request_count = 0
-        self.used_profiles = []  # 记录使用过的目录，用于清理
-        
-    def get_profile_dir(self):
-        """
-        获取当前的用户资料目录，如果需要则创建新的
-        """
-        if self.current_profile is None or self.request_count >= self.change_interval:
-            # 清理旧的目录
-            if self.current_profile:
-                self.used_profiles.append(self.current_profile)
-                
-            # 创建新的目录
-            self.current_profile = create_random_profile_dir(self.base_dir)
-            self.request_count = 0
-            logger.info(f"创建新的临时用户资料目录: {self.current_profile}")
-            
-        return self.current_profile
-    
-    def increment_count(self):
-        """
-        增加请求计数
-        """
-        self.request_count += 1
-        
-    def cleanup_all(self):
-        """
-        清理所有使用过的临时目录
-        """
-        if self.current_profile:
-            self.used_profiles.append(self.current_profile)
-            
-        for profile_dir in self.used_profiles:
-            cleanup_profile_dir(profile_dir)
-            
-        self.used_profiles = []
-        self.current_profile = None
 
 
 async def fetch_all_product_info(page, asin, country):
@@ -186,69 +117,51 @@ async def fetch_all_product_info(page, asin, country):
         return result
 
 
-async def run_scraper_batch(df_batch, profile_manager, concurrency, shared_results, progress_counter):
+async def run_scraper_batch(df_batch, profile_dir, concurrency, shared_results, progress_counter):
     """
-    运行一个批次的爬虫，每个ASIN抓取所有原始信息，使用动态更换的用户资料目录
+    运行一个批次的爬虫，每个ASIN抓取所有原始信息，使用固定的用户资料目录
     """
-    profile_dir = None
     context = None
+    pages = []
     
     try:
         async with async_playwright() as pw:
             # 创建页面池
-            pages = []
             page_queue = asyncio.Queue()
             
-            async def ensure_browser_context():
-                nonlocal profile_dir, context, pages, page_queue
-                
-                # 获取当前的用户资料目录
-                profile_dir = profile_manager.get_profile_dir()
-                
-                # 如果context存在，先关闭
-                if context:
-                    for p in pages:
-                        try:
-                            await p.close()
-                        except:
-                            pass
-                    await context.close()
-                    pages = []
-                    page_queue = asyncio.Queue()
-                
-                # 创建新的browser context
-                context = await pw.chromium.launch_persistent_context(
-                    profile_dir,
-                    headless=True,
-                    executable_path=r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-                    user_agent=DEFAULT_USER_AGENT,
-                    locale='en-US',
-                    timezone_id='America/New_York',
-                    viewport={'width': 1920, 'height': 1080}
-                )
-                
-                # 创建页面池
-                for _ in range(concurrency):
-                    page = await context.new_page()
-                    await page.set_extra_http_headers({
-                        "User-Agent": DEFAULT_USER_AGENT,
-                        "Accept-Language": "en-US,en;q=0.9"
-                    })
-                    pages.append(page)
-                    await page_queue.put(page)
+            # 创建browser context
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    context = await pw.chromium.launch_persistent_context(
+                        profile_dir,
+                        headless=True,
+                        executable_path=r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                        user_agent=DEFAULT_USER_AGENT,
+                        locale='en-US',
+                        timezone_id='America/New_York',
+                        viewport={'width': 1920, 'height': 1080}
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(f"创建浏览器上下文失败 (尝试 {attempt+1}/{max_retries}): {e}")
+                    if attempt == max_retries - 1:
+                        raise e
+                    await asyncio.sleep(1)
             
-            # 初始化browser context
-            await ensure_browser_context()
+            # 创建页面池
+            for _ in range(concurrency):
+                page = await context.new_page()
+                await page.set_extra_http_headers({
+                    "User-Agent": DEFAULT_USER_AGENT,
+                    "Accept-Language": "en-US,en;q=0.9"
+                })
+                pages.append(page)
+                await page_queue.put(page)
+            
+            logger.info(f"已创建浏览器上下文，profile: {profile_dir}")
             
             async def process_row(row_data):
-                nonlocal profile_dir, context
-                
-                # 检查是否需要更换用户资料目录
-                profile_manager.increment_count()
-                if profile_manager.request_count >= profile_manager.change_interval:
-                    logger.info(f"达到切换阈值，准备更换用户资料目录")
-                    await ensure_browser_context()
-                
                 page = await page_queue.get()
                 try:
                     asin = str(row_data.get('ASIN', '')).strip()
@@ -275,7 +188,12 @@ async def run_scraper_batch(df_batch, profile_manager, concurrency, shared_resul
                         'ERROR': str(e)
                     })
                 finally:
-                    await page_queue.put(page)
+                    # 检查页面是否仍然有效再放回队列
+                    try:
+                        if not page.is_closed():
+                            await page_queue.put(page)
+                    except Exception as e:
+                        logger.warning(f"页面放回队列时出错: {e}")
 
             # 创建任务
             tasks = [asyncio.create_task(process_row(row_data)) for _, row_data in df_batch.iterrows()]
@@ -286,27 +204,30 @@ async def run_scraper_batch(df_batch, profile_manager, concurrency, shared_resul
         if pages:
             for p in pages:
                 try:
-                    await p.close()
-                except:
-                    pass
+                    if not p.is_closed():
+                        await p.close()
+                except Exception as e:
+                    logger.debug(f"关闭页面时出错: {e}")
         if context:
-            await context.close()
+            try:
+                await context.close()
+            except Exception as e:
+                logger.debug(f"关闭浏览器上下文时出错: {e}")
 
 
-def worker_process(df_batch, profile_change_interval, concurrency, shared_results, progress_counter):
-    """子进程执行函数，使用动态用户资料目录"""
+def worker_process(df_batch, profile_dir, concurrency, shared_results, progress_counter):
+    """子进程执行函数，使用固定的用户资料目录"""
+    pid = os.getpid()
+    logger.info(f"[Worker-{pid}] 启动子进程，处理 {len(df_batch)} 条记录")
+    
     try:
-        # 每个进程创建自己的ProfileManager
-        profile_manager = ProfileManager(change_interval=profile_change_interval)
-        
-        try:
-            asyncio.run(run_scraper_batch(df_batch, profile_manager, concurrency, shared_results, progress_counter))
-        finally:
-            # 清理所有临时目录
-            profile_manager.cleanup_all()
+        asyncio.run(run_scraper_batch(df_batch, profile_dir, concurrency, shared_results, progress_counter))
+        logger.info(f"[Worker-{pid}] 处理完成")
             
     except Exception as e:
-        logger.error(f"[Worker] 发生异常: {e}")
+        logger.error(f"[Worker-{pid}] 发生异常: {e}")
+        import traceback
+        logger.error(f"[Worker-{pid}] 异常详情: {traceback.format_exc()}")
 
 
 async def fetch_bsr_only(page, asin, country):
@@ -358,71 +279,51 @@ async def fetch_bsr_only(page, asin, country):
         return result
 
 
-async def run_bsr_update_batch(df_batch, profile_manager, concurrency, shared_results, progress_counter):
+async def run_bsr_update_batch(df_batch, profile_dir, concurrency, shared_results, progress_counter):
     """
-    运行BSR更新批次，只抓取BSR信息，使用动态更换的用户资料目录
+    运行BSR更新批次，只抓取BSR信息，使用固定的用户资料目录
     """
-    profile_dir = None
     context = None
+    pages = []
     
     try:
         async with async_playwright() as pw:
             # 创建页面池
-            pages = []
             page_queue = asyncio.Queue()
             
-            async def ensure_browser_context():
-                nonlocal profile_dir, context, pages, page_queue
-                
-                # 获取当前的用户资料目录
-                profile_dir = profile_manager.get_profile_dir()
-                
-                # 如果context存在，先关闭
-                if context:
-                    for p in pages:
-                        try:
-                            await p.close()
-                        except:
-                            pass
-                    await context.close()
-                    pages = []
-                    page_queue = asyncio.Queue()
-                
-                # 创建新的browser context
-                context = await pw.chromium.launch_persistent_context(
-                    profile_dir,
-                    headless=True,
-                    executable_path=r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-                    user_agent=DEFAULT_USER_AGENT,
-                    locale='en-US',
-                    timezone_id='America/New_York',
-                    viewport={'width': 1920, 'height': 1080}
-                )
-                
-                # 创建页面池
-                for _ in range(concurrency):
-                    page = await context.new_page()
-                    await page.set_extra_http_headers({
-                        "User-Agent": DEFAULT_USER_AGENT,
-                        "Accept-Language": "en-US,en;q=0.9"
-                    })
-                    pages.append(page)
-                    await page_queue.put(page)
+            # 创建browser context
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    context = await pw.chromium.launch_persistent_context(
+                        profile_dir,
+                        headless=True,
+                        executable_path=r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                        user_agent=DEFAULT_USER_AGENT,
+                        locale='en-US',
+                        timezone_id='America/New_York',
+                        viewport={'width': 1920, 'height': 1080}
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(f"BSR创建浏览器上下文失败 (尝试 {attempt+1}/{max_retries}): {e}")
+                    if attempt == max_retries - 1:
+                        raise e
+                    await asyncio.sleep(1)
             
-            # 初始化browser context
-            logger.info(f"[BSR-Worker] 正在启动浏览器和创建页面池...")
-            await ensure_browser_context()
-            logger.info(f"[BSR-Worker] 浏览器启动完成，页面池已创建 ({concurrency} 个页面)")
+            # 创建页面池
+            for _ in range(concurrency):
+                page = await context.new_page()
+                await page.set_extra_http_headers({
+                    "User-Agent": DEFAULT_USER_AGENT,
+                    "Accept-Language": "en-US,en;q=0.9"
+                })
+                pages.append(page)
+                await page_queue.put(page)
+            
+            logger.info(f"BSR已创建浏览器上下文，profile: {profile_dir}")
 
             async def process_bsr_row(row_data):
-                nonlocal profile_dir, context
-                
-                # 检查是否需要更换用户资料目录
-                profile_manager.increment_count()
-                if profile_manager.request_count >= profile_manager.change_interval:
-                    logger.info(f"BSR更新：达到切换阈值，准备更换用户资料目录")
-                    await ensure_browser_context()
-                
                 page = await page_queue.get()
                 try:
                     asin = str(row_data.get('ASIN', '')).strip()
@@ -451,7 +352,12 @@ async def run_bsr_update_batch(df_batch, profile_manager, concurrency, shared_re
                         'ERROR': str(e)
                     })
                 finally:
-                    await page_queue.put(page)
+                    # 检查页面是否仍然有效再放回队列
+                    try:
+                        if not page.is_closed():
+                            await page_queue.put(page)
+                    except Exception as e:
+                        logger.warning(f"BSR页面放回队列时出错: {e}")
 
             # 创建任务
             tasks = [asyncio.create_task(process_bsr_row(row_data)) for _, row_data in df_batch.iterrows()]
@@ -462,27 +368,24 @@ async def run_bsr_update_batch(df_batch, profile_manager, concurrency, shared_re
         if pages:
             for p in pages:
                 try:
-                    await p.close()
-                except:
-                    pass
+                    if not p.is_closed():
+                        await p.close()
+                except Exception as e:
+                    logger.debug(f"BSR关闭页面时出错: {e}")
         if context:
-            await context.close()
+            try:
+                await context.close()
+            except Exception as e:
+                logger.debug(f"BSR关闭浏览器上下文时出错: {e}")
 
 
-def bsr_update_worker_process(df_batch, profile_change_interval, concurrency, shared_results, progress_counter):
-    """BSR更新子进程执行函数，使用动态用户资料目录"""
+def bsr_update_worker_process(df_batch, profile_dir, concurrency, shared_results, progress_counter):
+    """BSR更新子进程执行函数，使用固定的用户资料目录"""
     try:
         logger.info(f"[BSR-Worker] 进程启动，处理 {len(df_batch)} 条记录，并发数: {concurrency}")
         
-        # 每个进程创建自己的ProfileManager
-        profile_manager = ProfileManager(change_interval=profile_change_interval)
-        
-        try:
-            asyncio.run(run_bsr_update_batch(df_batch, profile_manager, concurrency, shared_results, progress_counter))
-        finally:
-            # 清理所有临时目录
-            profile_manager.cleanup_all()
-            logger.info(f"[BSR-Worker] 进程完成，已清理临时目录")
+        asyncio.run(run_bsr_update_batch(df_batch, profile_dir, concurrency, shared_results, progress_counter))
+        logger.info(f"[BSR-Worker] 进程完成")
             
     except Exception as e:
         logger.error(f"[BSR-Worker] 发生异常: {e}")
@@ -512,7 +415,7 @@ def save_temp_results(results, temp_file):
         logger.info(f"已保存 {len(results)} 条结果到 {temp_file}")
 
 
-def update_bsr_mode(df, input_file, processes, concurrency, profile_change_interval):
+def update_bsr_mode(df, input_file, processes, concurrency):
     """
     BSR更新模式主函数
     """
@@ -549,7 +452,6 @@ def update_bsr_mode(df, input_file, processes, concurrency, profile_change_inter
     
     print(f"\n=== 启动 {processes} 个BSR更新进程 ===")
     print(f"每个进程并发数: {concurrency}")
-    print(f"反爬间隔: 每 {profile_change_interval} 个请求更换临时目录")
     print(f"总计需要更新: {total_to_update} 条记录")
     print("正在启动浏览器进程...")
     
@@ -561,11 +463,13 @@ def update_bsr_mode(df, input_file, processes, concurrency, profile_change_inter
             continue
             
         df_slice = needs_bsr_update.iloc[start_idx:end_idx].copy()
+        # 为每个进程创建独立的用户资料目录
+        profile_dir = f"temp/bsr_profile_{idx}"
         
-        p = Process(target=bsr_update_worker_process, args=(df_slice, profile_change_interval, concurrency, shared_results, progress_counter))
+        p = Process(target=bsr_update_worker_process, args=(df_slice, profile_dir, concurrency, shared_results, progress_counter))
         p.start()
         processes_list.append(p)
-        logger.info(f"启动BSR更新子进程 {p.pid}，处理行 {start_idx}-{end_idx-1}，反爬间隔: {profile_change_interval}")
+        logger.info(f"启动BSR更新子进程 {p.pid}，处理行 {start_idx}-{end_idx-1}，使用profile: {profile_dir}")
         print(f"✓ 进程 {idx+1}/{processes} 已启动 (PID: {p.pid})")
     
     print(f"\n=== 所有进程已启动，等待浏览器初始化完成 ===")
@@ -686,21 +590,18 @@ def update_bsr_mode(df, input_file, processes, concurrency, profile_change_inter
 @click.option('--sleep-time', '-t', 'sleep_time', default=5, type=int, help='批次间隔秒数')
 @click.option('--processes', '-p', 'processes', default=2, type=int, help='爬虫进程数')
 @click.option('--concurrency', '-c', 'concurrency', default=3, type=int, help='每进程协程数')
-@click.option('--profile-template', 'profile_template', default='temp/browser_profile_', help='浏览器用户数据目录前缀（已弃用，使用随机目录）')
-@click.option('--profile-change-interval', '-r', 'profile_change_interval', default=100, type=int, help='多少个请求后更换临时用户资料目录（反爬机制）')
 @click.option('--output', '-o', 'output_file', default='temp/spider_raw_output.csv', help='爬虫原始数据输出CSV文件路径')
 @click.option('--update-bsr', '-u', 'update_bsr', is_flag=True, help='仅更新源文件中BSR品类为空的记录')
 def main(input_file, encoding, sep, batch_size, sleep_time, processes, concurrency, 
-         profile_template, profile_change_interval, output_file, update_bsr):
+         output_file, update_bsr):
     """
     Amazon产品信息爬虫，专门负责抓取产品的原始数据
     包括BSR、评分、评论数、标题、描述、产品概览、主图等
     
-    使用随机临时用户资料目录反爬机制，每处理指定数量的请求后自动更换新的临时目录
+    使用固定的用户资料目录，每个进程使用独立的profile目录
     """
     
     logger.info("=== 启动 All-in-One Amazon Spider ===")
-    logger.info(f"反爬设置：每 {profile_change_interval} 个请求更换临时用户资料目录")
     
     # 1. 读取输入文件
     try:
@@ -726,7 +627,7 @@ def main(input_file, encoding, sep, batch_size, sleep_time, processes, concurren
     
     # 如果是BSR更新模式，走独立的更新流程
     if update_bsr:
-        update_bsr_mode(df, input_file, processes, concurrency, profile_change_interval)
+        update_bsr_mode(df, input_file, processes, concurrency)
         return
         
     # 正常模式：检查断点续爬
@@ -767,11 +668,13 @@ def main(input_file, encoding, sep, batch_size, sleep_time, processes, concurren
                 continue
                 
             df_slice = remaining_df.iloc[start_idx:end_idx].copy()
+            # 为每个进程创建独立的用户资料目录
+            profile_dir = f"temp/spider_profile_{idx}"
             
-            p = Process(target=worker_process, args=(df_slice, profile_change_interval, concurrency, shared_results, progress_counter))
+            p = Process(target=worker_process, args=(df_slice, profile_dir, concurrency, shared_results, progress_counter))
             p.start()
             processes_list.append(p)
-            logger.info(f"启动爬虫子进程 {p.pid}，处理行 {start_idx}-{end_idx-1}，反爬间隔: {profile_change_interval}")
+            logger.info(f"启动爬虫子进程 {p.pid}，处理行 {start_idx}-{end_idx-1}，使用profile: {profile_dir}")
         
         # 显示总进度
         pbar_total = tqdm(total=total_remaining, desc='爬虫总进度')

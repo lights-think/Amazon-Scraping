@@ -111,6 +111,16 @@ async def extract_bsr_from_node(node):
         r'(?:排第|排名第)([0-9,，]+)名\s*([^排名（]+?)(?:\s*（|$)'  # 中文
     ]
     
+    # 导航短语定义
+    NAV_PHRASES = [
+        'See Top 100 in ', 'Top 100 in ',
+        'Visualizza i Top 100 nella categoria', 'Ver el Top 100 en',
+        'Visa Topp 100 i', 'Voir les 100 premiers en',
+        'Ver os 100 mais vendidos em', 'Top 100 auf',
+        'Top 100 in', 'Top 100 dans', 'Top 100 en',
+        'Top 100 dei', 'Top 100 der', 'Top 100 de',
+    ]
+    
     # 新增：处理特殊情况，当节点是包含"Best Sellers Rank"的span时，先提取父类再递归处理子类
     span_text = ""
     try:
@@ -163,21 +173,26 @@ async def extract_bsr_from_node(node):
                     text = await li.inner_text()
             text = re.sub(r'\s+', ' ', text).strip()
             # --- 增强：结构化提取BSR，精准区分导航li和真实BSR li ---
-            NAV_PHRASES = [
-                'See Top 100 in ', 'Top 100 in ',
-                'Visualizza i Top 100 nella categoria', 'Ver el Top 100 en',
-                'Visa Topp 100 i', 'Voir les 100 premiers en',
-                'Ver os 100 mais vendidos em', 'Top 100 auf',
-                'Top 100 in', 'Top 100 dans', 'Top 100 en',
-                'Top 100 dei', 'Top 100 der', 'Top 100 de',
-            ]
             text_stripped = text.strip()
+            
+            # 预过滤：排除明显不是BSR的内容
+            non_bsr_indicators = [
+                'app', 'dispositivi', '账户', 'account', 'crea', 'create',
+                'stjärna', '星', 'star', '%', 'gratis', 'free', 'fai da te',
+                'rating', 'review', 'condition', 'sell', 'cart', 'buy',
+                'add to', 'wish', 'list', 'help', 'customer service'
+            ]
+            
+            if any(indicator in text_stripped.lower() for indicator in non_bsr_indicators):
+                logging.debug(f"[BSR-PREFILTER] 跳过非BSR内容: '{text_stripped}'")
+                continue
+            
             # 1. 导航li判别：仅当未包含有效排名或排名为100时跳过
             if any(nav_phrase in text_stripped for nav_phrase in NAV_PHRASES):
                 m_rank = re.search(r'([0-9]+[\s,\.0-9]*)', text_stripped)
                 rank_candidate = m_rank.group(1).replace(',', '').replace('.', '').replace(' ', '') if m_rank else ''
                 if (not rank_candidate.isdigit()) or int(rank_candidate) == 100:
-                    logging.info(f"[BSR-NAV-SKIP] 跳过导航链接: '{text_stripped}'")
+                    logging.debug(f"[BSR-NAV-SKIP] 跳过导航链接: '{text_stripped}'")
                     continue
             # 2. 若li主文本为"#N in "，a标签文本为category，则category取a标签文本
             m = re.match(r'[#nNoNr\.\s]*(\d+[,.\d]*)\s+in\s*$', text_stripped, re.IGNORECASE)
@@ -217,7 +232,11 @@ async def extract_bsr_from_node(node):
                                 logging.info(f"[BSR-FILTER] 排除导航链接: rank={rank_str}, category={cat}, text='{text}'")
                                 continue
                             results.append((rank_str, cat))
-            logging.info(f"[BSR-LI] li_text='{text}' matches={results}")
+            # 只有在实际找到匹配结果时才记录
+            if found:
+                logging.info(f"[BSR-LI] li_text='{text}' matches={results[-len(matches):] if matches else []}")
+            else:
+                logging.debug(f"[BSR-LI] li_text='{text}' matches=[]")
     else:
         text = await node.inner_text()
         text = re.sub(r'\s+', ' ', text).strip()
@@ -246,8 +265,79 @@ async def extract_bsr_from_node(node):
                             logging.info(f"[BSR-FILTER-NON-LI] 排除导航链接: rank={rank_str}, category={cat}, text='{text}'")
                             continue
                         results.append((rank_str, cat))
-        logging.info(f"[BSR-NON-LI] text='{text}' matches={results}")
+        # 只有在找到匹配时才记录详细信息
+        if results:
+            logging.info(f"[BSR-NON-LI] text='{text}' matches={results}")
+        else:
+            logging.debug(f"[BSR-NON-LI] text='{text}' matches=[]")
     return results
+
+def is_valid_category_name(category):
+    """
+    验证品类名称是否有效，排除CSS选择器、JavaScript代码等无效内容
+    """
+    if not category or not isinstance(category, str):
+        return False
+    
+    category = category.strip()
+    
+    # 排除空字符串或过短的字符串
+    if len(category) < 3:
+        return False
+    
+    # 排除CSS选择器特征（注意：需要更精确的匹配以避免误判）
+    css_indicators = [
+        '.a-', '._', '[class', '[id', 'jquery', 'javascript',
+        'css', 'style', 'div', 'span', 'html', 'body', 'script',
+        'function', 'var ', 'let ', 'const ', 'return', '{', '}',
+        'px', 'em;', 'rem;', 'color:', 'rgb(', 'rgba(',
+        'width:', 'height:', 'margin:', 'padding:', 'border:',
+        'display:', 'position:', 'float:', 'clear:', 'overflow:',
+        'vsewidgetpagestate', 'dnNlL', 'amazonaws', 'cloudfront'
+    ]
+    
+    # 排除用户界面相关词汇
+    ui_indicators = [
+        'app', 'dispositivi', 'account', 'crea', 'create',
+        'stjärna', 'star', 'gratis', 'free', 'fai da te',
+        'aziendale', 'business', 'gratuito', 'login', 'signup'
+    ]
+    
+    category_lower = category.lower()
+    if any(indicator in category_lower for indicator in css_indicators):
+        return False
+    
+    # 排除用户界面相关内容
+    if any(indicator in category_lower for indicator in ui_indicators):
+        return False
+    
+    # 排除以下划线开头或结尾的字符串（通常是程序变量）
+    if category.startswith('_') or category.endswith('_'):
+        return False
+    
+    # 排除包含多个连续特殊字符的字符串
+    if any(special * 3 in category for special in '.,_-#'):
+        return False
+    
+    # 排除过多特殊字符的字符串，但允许常见的品类分隔符
+    special_char_count = sum(1 for c in category if not c.isalnum() and c not in ' -&/\'()[]')
+    if special_char_count > len(category) * 0.3:  # 允许30%的特殊字符，以适应复杂品类名
+        return False
+    
+    # 排除全数字或主要是数字的字符串
+    digit_count = sum(1 for c in category if c.isdigit())
+    if digit_count > len(category) * 0.7:  # 数字超过70%
+        return False
+    
+    # 必须包含字母
+    if not any(c.isalpha() for c in category):
+        return False
+    
+    # 特殊检查：包含多个点或逗号的可能是CSS选择器
+    if category.count('.') >= 2 or category.count(',') >= 2:
+        return False
+    
+    return True
 
 async def fetch_product_data(page, url):
     # 随机延时，模拟人类访问
@@ -753,30 +843,43 @@ async def fetch_product_data(page, url):
         await page.wait_for_timeout(2000)
         try:
             logging.info(f"Retrying BSR extraction for {url}")
-            retry_elements = await page.query_selector_all('xpath=//*[contains(text(),"#") or contains(text(),"No.") or contains(text(),"Nr.") or contains(text(),"n°") or contains(text(),"nº") or contains(text(),"位") or contains(text(),"排")]')
+            # 更精确的XPath选择器，排除script、style等元素
+            retry_elements = await page.query_selector_all('xpath=//*[not(self::script) and not(self::style) and not(self::noscript) and (contains(text(),"#") or contains(text(),"No.") or contains(text(),"Nr.") or contains(text(),"n°") or contains(text(),"nº") or contains(text(),"位") or contains(text(),"排")) and (contains(text(),"Best Sellers") or contains(text(),"Rangordning") or contains(text(),"Plaats") or contains(text(),"Clasificación") or contains(text(),"Classement") or contains(text(),"Bestseller") or contains(text(),"Posizione") or contains(text(),"売れ筋") or contains(translate(text(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "category") or contains(translate(text(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "product"))]')
             
             for element in retry_elements:
                 text = await element.inner_text()
                 text = re.sub(r'\s+', ' ', text).strip()
                 
-                # 最终兜底的极宽松匹配
+                # 跳过明显的非BSR内容
+                if (len(text) > 500 or  # 过长的文本
+                    any(word in text.lower() for word in ['javascript', 'css', 'function', 'var ', 'let ', 'const ', 'return']) or  # 代码内容
+                    text.count('.') > 10 or text.count('_') > 5 or  # 过多特殊字符
+                    'vseWidgetPageState' in text or 'dnNlL' in text):  # 特定的无效标识
+                    continue
+                
+                # 更严格的最终匹配模式
                 final_patterns = [
-                    r'#([0-9]+(?:\s+[0-9]{3})*)\s+i\s+([^0-9(]{2,}?)(?:\s*\(|$)',  # 瑞典空格
-                    r'#([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^0-9(]{3,}?)(?:\s*\(|$)',  # 荷兰句号
-                    r'(?:nº|n°|Nr\.|No\.)\s*([0-9]+(?:[\s.,][0-9]{3})*)\s+(?:en|in|dans|bei)\s+([^0-9(]{3,}?)(?:\s*\(|$)',  # 欧洲通用
-                    r'([0-9,，.]+)位([^0-9（\(]{2,}?)(?:\s*（|\s*\(|$)',  # 日语位
-                    r'(?:^|[^0-9])([0-9]{1,7}(?:[,.\s][0-9]{3})*)\s*(?:in|i|en|dans|bei|位|名)\s+([^0-9(]{2,}?)(?:\s*\(|[0-9]|$)'  # 超宽松
+                    r'#([0-9]+(?:\s+[0-9]{3})*)\s+i\s+([^0-9(]{3,20}?)(?:\s*\(|$)',  # 瑞典空格格式
+                    r'#([0-9]+(?:\.[0-9]{3})*)\s+in\s+([^0-9(]{3,30}?)(?:\s*\(|$)',  # 荷兰句号格式
+                    r'(?:nº|n°|Nr\.|No\.)\s*([0-9]+(?:[\s.,][0-9]{3})*)\s+(?:en|in|dans|bei)\s+([^0-9(]{3,30}?)(?:\s*\(|$)',  # 欧洲通用格式
+                    r'([0-9,，.]+)位([^0-9（\(]{3,20}?)(?:\s*（|\s*\(|$)',  # 日语位格式
                 ]
                 
                 for pattern in final_patterns:
                     loose_matches = re.findall(pattern, text, re.IGNORECASE)
                     if loose_matches:
                         rank_str = loose_matches[0][0].replace(',', '').replace('，', '').replace('.', '').replace(' ', '')
-                        if rank_str.isdigit() and 1 <= int(rank_str) <= 10000000:
+                        potential_category = loose_matches[0][1].strip()
+                        
+                        # 严格验证排名和品类名
+                        if (rank_str.isdigit() and 1 <= int(rank_str) <= 10000000 and 
+                            is_valid_category_name(potential_category)):
                             main_rank = rank_str
-                            main_category = loose_matches[0][1].strip()
+                            main_category = potential_category
                             logging.info(f"ASIN from URL {url} - BSR parsed via Retry (Final): main={main_rank}/{main_category}")
                             break
+                        else:
+                            logging.debug(f"[BSR-RETRY-REJECT] 拒绝无效匹配: rank={rank_str}, category='{potential_category}'")
                 
                 if main_rank:
                     break
@@ -914,6 +1017,19 @@ async def fetch_product_data(page, url):
         else:
             review_count = '' # 如果正则匹配失败，说明格式不对，清空
     
+    # === 最终BSR验证和清理 ===
+    # 验证主类别名有效性
+    if main_category and not is_valid_category_name(main_category):
+        logging.warning(f"[BSR最终验证] 主类别无效，已清空: '{main_category}'")
+        main_category = ''
+        main_rank = ''
+    
+    # 验证子类别名有效性
+    if sub_category and not is_valid_category_name(sub_category):
+        logging.warning(f"[BSR最终验证] 子类别无效，已清空: '{sub_category}'")
+        sub_category = ''
+        sub_rank = ''
+
     # 最终日志记录
     logging.info(f"ASIN from URL {url} - Final parsed data: BSR={main_rank}/{main_category}, Sub={sub_rank}/{sub_category}, Rating={rating}, Reviews={review_count}")
 
@@ -1009,7 +1125,7 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir, progress_c
         # 子进程禁用局部进度条，由主进程统一展示
         pbar = tqdm(total=len(df), desc='Scraping', disable=(progress_counter is not None))
 
-        async def process_row(pos, row_data): # Renamed row to row_data
+        async def process_row(pos, row_data):
             page = await page_queue.get()
             try:
                 asin = str(row_data.get('ASIN', '')).strip()
@@ -1033,11 +1149,17 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir, progress_c
                     url_with_lang = url + '&language=en_US'
                 else:
                     url_with_lang = url + '?language=en_US'
+                
                 # 传递拼接后的URL给fetch_product_data
                 # 注：解析规则不变，兼容多语言
                 for attempt in range(1, max_retries + 1):
                     logging.info(f"ASIN={asin} - Attempt {attempt}/{max_retries} for product data.")
                     try:
+                        # 检查页面是否仍然有效
+                        if page.is_closed():
+                            logging.warning(f"ASIN={asin} - Page已关闭，跳过处理")
+                            break
+                        
                         main_cat, main_rank, sub_cat, sub_rank, rating, reviews = await fetch_product_data(page, url_with_lang)
                         # 检查核心数据是否都获取到
                         if main_rank and rating and reviews: # 主要BSR排名，评分和评论数是核心
@@ -1075,16 +1197,14 @@ async def run_scraper(df, results_list_ref, concurrency, profile_dir, progress_c
                 if results_list_ref[pos] is None: # 如果还没赋值
                     results_list_ref[pos] = {'ASIN': str(row_data.get('ASIN', '')).strip(), 'country': str(row_data.get('country', '')).strip().upper(), 'ERROR': str(e_process)}
             finally:
-                await page_queue.put(page)
+                # 检查页面是否仍然有效再放回队列
+                if not page.is_closed():
+                    await page_queue.put(page)
                 pbar.update(1)
                 # 更新跨进程共享计数器
                 if progress_counter is not None:
-                    try:
-                        with progress_counter.get_lock():
-                            progress_counter.value += 1
-                    except AttributeError:
-                        # Manager.Value 返回的 ValueProxy 无 get_lock()
-                        progress_counter.value += 1
+                    # Manager.Value 创建的对象直接访问即可
+                    progress_counter.value += 1
 
         tasks = [asyncio.create_task(process_row(pos, row_data)) for pos, (_, row_data) in enumerate(df.iterrows())]
         await asyncio.gather(*tasks)
@@ -1245,19 +1365,12 @@ def multi_process_scraper(df, profile_template: str, profile_count: int, concurr
     total_tasks = len(df)
     pbar_total = tqdm(total=total_tasks, desc='Total Progress')
     while any(p.is_alive() for p in processes):
-        try:
-            with progress_counter.get_lock():
-                completed = progress_counter.value
-        except AttributeError:
-            completed = progress_counter.value
+        # Manager.Value 创建的对象没有 get_lock() 方法，直接访问即可
+        completed = progress_counter.value
         pbar_total.update(completed - pbar_total.n)
         time.sleep(0.5)
     # 子进程已全部完成，再做一次最终更新
-    try:
-        with progress_counter.get_lock():
-            completed = progress_counter.value
-    except AttributeError:
-        completed = progress_counter.value
+    completed = progress_counter.value
     pbar_total.update(completed - pbar_total.n)
     pbar_total.close()
 
