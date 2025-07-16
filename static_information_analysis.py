@@ -33,15 +33,17 @@ sku,color,material,shape,yolo_color,yolo_shape,llm_color,llm_material,llm_shape,
     python static_information_analysis.py -e products.xlsx -o detailed_results.csv -b 5
     
 工作流程:
-    1. 预爬取阶段: 如果启用--amazon，会先批量爬取所有ASIN的五点描述
-    2. 图片分析阶段: 使用YOLO检测+几何分析进行视觉特征提取
-    3. AI分析阶段: 结合产品标题+五点描述进行LLM特征识别
-    4. 结果输出阶段: 生成详细对比CSV，包含各种分析方法的结果
+    1. 扫描阶段: 扫描图片文件，在测试模式下随机抽取50个图片
+    2. 预爬取阶段: 根据选定的图片确定需要爬取的SKU，批量获取对应ASIN的五点描述
+    3. 图片分析阶段: 使用YOLO检测+几何分析进行视觉特征提取
+    4. AI分析阶段: 结合产品标题+五点描述进行LLM特征识别
+    5. 结果输出阶段: 生成详细对比CSV，包含各种分析方法的结果
 
 命令行参数:
-    --amazon: 启用亚马逊五点描述爬取功能
-    --llm-shape: 启用多模态LLM形状识别
-    --advanced-bg: 启用高级背景去除技术
+    --amazon: 启用亚马逊五点描述爬取功能（强烈推荐，Excel文件无五点描述时必需）
+    --llm-shape: 启用多模态LLM形状识别（实验性功能）
+    --advanced-bg: 启用高级背景去除技术（适用于复杂背景）
+    --test: 测试模式，随机抽取50个图片分析（只爬取对应的ASIN）
 
 环境要求:
     - Ollama服务运行中，已安装gemma3:latest和llava:latest模型
@@ -1067,19 +1069,43 @@ def load_excel_data(excel_file):
         return {}
 
 
-async def pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl):
+async def pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus=None):
     """
-    预先爬取所有需要的亚马逊五点描述数据
+    预先爬取需要的亚马逊五点描述数据
+    
+    Args:
+        sku_info_map: SKU信息映射
+        enable_amazon_crawl: 是否启用亚马逊爬取
+        target_skus: 目标SKU列表，如果为None则爬取所有SKU
     """
+    # 检查是否有可爬取的ASIN
+    has_asin = any(info.get('asin', '').strip() for info in sku_info_map.values())
+    
     if not enable_amazon_crawl:
+        if has_asin:
+            logger.warning("检测到Excel中有ASIN信息，建议启用 --amazon 参数获取五点描述以提高分析准确性")
         logger.info("未启用亚马逊爬取功能，跳过五点描述预爬取")
         return {}
     
-    # 收集所有需要爬取的ASIN
+    if not has_asin:
+        logger.warning("Excel文件中没有ASIN信息，无法进行五点描述爬取")
+        return {}
+    
+    # 收集需要爬取的ASIN（根据target_skus过滤）
     asin_to_crawl = {}
-    for sku, info in sku_info_map.items():
+    skus_to_process = target_skus if target_skus is not None else sku_info_map.keys()
+    
+    logger.info(f"开始收集ASIN信息，目标SKU数量: {len(skus_to_process)}")
+    
+    for sku in skus_to_process:
+        if sku not in sku_info_map:
+            logger.warning(f"SKU {sku} 不在Excel数据中，跳过")
+            continue
+            
+        info = sku_info_map[sku]
         asin = info.get('asin', '')
         country = info.get('country', 'US')
+        
         if asin and asin.strip():
             asin_key = f"{asin}_{country}"
             if asin_key not in asin_to_crawl:
@@ -1090,6 +1116,8 @@ async def pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl):
                 }
             else:
                 asin_to_crawl[asin_key]['skus'].append(sku)
+        else:
+            logger.warning(f"SKU {sku} 没有ASIN信息，无法爬取五点描述")
     
     if not asin_to_crawl:
         logger.warning("没有找到需要爬取的ASIN信息")
@@ -1158,15 +1186,9 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
             logger.error("无法从Excel文件中加载数据")
             return
         
-        # 预爬取亚马逊五点描述数据
-        logger.info("=" * 60)
-        logger.info("步骤1: 预爬取亚马逊五点描述数据")
-        logger.info("=" * 60)
-        bullet_points_cache = asyncio.run(pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl))
-        
         # 查找图片文件
         logger.info("=" * 60)
-        logger.info("步骤2: 扫描图片文件")
+        logger.info("步骤1: 扫描图片文件")
         logger.info("=" * 60)
         image_files = find_image_files(image_folder)
         if not image_files:
@@ -1178,6 +1200,20 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
             sample_size = min(50, len(image_files))
             image_files = random.sample(image_files, sample_size)
             logger.info(f"测试模式启用，仅抽取{sample_size}个图片进行分析")
+        
+        # 根据要处理的图片文件确定需要爬取的SKU
+        target_skus = []
+        for filename in image_files:
+            sku = get_sku_from_filename(filename)
+            target_skus.append(sku)
+        
+        logger.info(f"确定需要分析的SKU数量: {len(target_skus)}")
+        
+        # 预爬取亚马逊五点描述数据（只爬取目标SKU的ASIN）
+        logger.info("=" * 60)
+        logger.info("步骤2: 预爬取亚马逊五点描述数据")
+        logger.info("=" * 60)
+        bullet_points_cache = asyncio.run(pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus))
         
         # 准备结果数据
         results = []
