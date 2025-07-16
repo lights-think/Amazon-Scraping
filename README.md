@@ -411,3 +411,109 @@ MIT License - 详见 [LICENSE](LICENSE) 文件
 - 发送邮件至项目维护者
 
 **注意**：本工具仅供学习和研究使用，请遵守Amazon的robots.txt和使用条款，避免过度请求对服务器造成负担。 
+
+## 静态信息分析改进版 (static_information_analysis.py)
+
+### 主要改进
+
+1. **YOLO背景过滤优化**
+   - 基于官方COCO数据集准确类别ID (0-79) 过滤背景物体
+   - 涵盖家具类 (chair, sofa, bed, dining table)、电器类 (tv, laptop, microwave) 等
+   - 参考权威数据源确保过滤准确性，专注产品本身识别
+
+2. **几何形状识别增强**
+   - 使用OpenCV轮廓分析和多边形近似算法
+   - 椭圆拟合算法判断圆形/椭圆形
+   - 基于顶点数量精确识别三角形、四边形、六边形、八边形等
+   - 结合面积/周长比例计算圆形度指标
+
+3. **亚马逊五点描述爬取**
+   - 完全参考basic_information_identification.py的成熟实现
+   - 集成反爬虫处理和多国家域名支持
+   - 结合标题和五点描述进行精准材质推断
+
+4. **多模态LLM集成**
+   - 使用Ollama本地API调用LLaVA多模态模型进行图像形状识别  
+   - 备选方案：gemma3:latest文本模型推断
+   - 支持图像+文本混合分析，提高识别准确性
+
+5. **AI模型统一升级**
+   - 所有AI分析模块统一使用gemma3:latest模型
+   - 替换原有的qwen3模型，提高分析质量和一致性
+
+### 使用方法
+
+#### 基础使用（仅本地分析）
+```bash
+python static_information_analysis.py -e products.xlsx -i data/产品图片
+```
+
+#### 启用亚马逊爬取功能
+```bash
+python static_information_analysis.py -e products.xlsx --amazon
+```
+
+#### 启用多模态LLM形状识别（需要Ollama环境）
+```bash
+python static_information_analysis.py -e products.xlsx --llm-shape
+```
+
+#### 完整功能组合
+```bash
+python static_information_analysis.py \
+  -e products.xlsx \
+  -i data/产品图片 \
+  -o enhanced_features.csv \
+  --amazon \
+  --llm-shape \
+  -b 5
+```
+
+### 环境配置要求
+
+#### Ollama环境配置
+```bash
+# 1. 安装并启动Ollama服务
+# 下载地址: https://ollama.ai/
+
+# 2. 安装所需模型
+ollama pull gemma3:latest    # 文本分析模型
+ollama pull llava:latest     # 多模态图像分析模型
+
+# 3. 验证模型安装
+ollama list
+```
+
+### Excel文件格式要求
+
+**必需列：**
+- `product_sku`: 产品SKU，用于匹配图片文件名
+
+**可选列：**
+- `product_title_en`: 产品英文标题
+- `ASIN`: 亚马逊产品标识符（启用`--amazon`时需要）
+- `country`: 国家代码，如US、UK、DE等（默认US）
+
+### 输出结果
+
+增强后的输出包含：
+- `sku`: 产品SKU
+- `color`: 颜色（YOLO主色分析 + AI识别）
+- `material`: 材质（AI分析，可结合亚马逊五点描述）
+- `shape`: 形状（几何分析 + 可选的多模态LLM）
+
+### 性能优化建议
+
+1. **批次大小调整**: 使用`-b`参数控制批次大小，建议5-10
+2. **按需启用功能**: 只在需要时启用`--amazon`和`--llm-shape`
+3. **网络延时**: 启用亚马逊爬取时会增加处理时间
+4. **资源消耗**: 几何分析会增加CPU使用，多模态LLM需要更多GPU资源
+
+### 故障排除
+
+**常见问题：**
+1. Chrome浏览器路径错误 → 检查`executable_path`设置
+2. YOLO模型下载失败 → 确保网络连接正常
+3. 亚马逊访问受限 → 调整请求间隔或使用代理
+
+**日志文件：** `static_analysis.log` 
