@@ -26,11 +26,17 @@ sku,color,material,shape,yolo_color,yolo_shape,llm_color,llm_material,llm_shape,
     # 基础使用（智能背景检测默认开启）
     python static_information_analysis.py -e products.xlsx
     
-    # 启用所有高级功能
+    # 启用亚马逊五点描述预爬取 + 所有高级功能
     python static_information_analysis.py -e products.xlsx --amazon --llm-shape --advanced-bg
     
     # 自定义输出和批次大小
     python static_information_analysis.py -e products.xlsx -o detailed_results.csv -b 5
+    
+工作流程:
+    1. 预爬取阶段: 如果启用--amazon，会先批量爬取所有ASIN的五点描述
+    2. 图片分析阶段: 使用YOLO检测+几何分析进行视觉特征提取
+    3. AI分析阶段: 结合产品标题+五点描述进行LLM特征识别
+    4. 结果输出阶段: 生成详细对比CSV，包含各种分析方法的结果
 
 命令行参数:
     --amazon: 启用亚马逊五点描述爬取功能
@@ -1068,6 +1074,79 @@ def load_excel_data(excel_file):
 @click.option('--enable-amazon-crawl', '--amazon', is_flag=True, help='启用亚马逊五点描述爬取功能（需要ASIN列）')
 @click.option('--enable-multimodal-llm', '--llm-shape', is_flag=True, help='启用多模态LLM进行形状识别（实验性功能）')
 @click.option('--enable-advanced-bg-removal', '--advanced-bg', is_flag=True, help='启用高级背景去除技术（基于图像分割和颜色分析）')
+async def pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl):
+    """
+    预先爬取所有需要的亚马逊五点描述数据
+    """
+    if not enable_amazon_crawl:
+        logger.info("未启用亚马逊爬取功能，跳过五点描述预爬取")
+        return {}
+    
+    # 收集所有需要爬取的ASIN
+    asin_to_crawl = {}
+    for sku, info in sku_info_map.items():
+        asin = info.get('asin', '')
+        country = info.get('country', 'US')
+        if asin and asin.strip():
+            asin_key = f"{asin}_{country}"
+            if asin_key not in asin_to_crawl:
+                asin_to_crawl[asin_key] = {
+                    'asin': asin,
+                    'country': country,
+                    'skus': [sku]
+                }
+            else:
+                asin_to_crawl[asin_key]['skus'].append(sku)
+    
+    if not asin_to_crawl:
+        logger.warning("没有找到需要爬取的ASIN信息")
+        return {}
+    
+    logger.info(f"开始预爬取 {len(asin_to_crawl)} 个不同的ASIN五点描述...")
+    
+    # 批量爬取五点描述
+    bullet_points_cache = {}
+    crawl_errors = []
+    
+    for i, (asin_key, asin_info) in enumerate(asin_to_crawl.items(), 1):
+        asin = asin_info['asin']
+        country = asin_info['country']
+        skus = asin_info['skus']
+        
+        try:
+            logger.info(f"[{i}/{len(asin_to_crawl)}] 正在爬取ASIN {asin} ({country}) - 关联SKU: {', '.join(skus[:3])}{'...' if len(skus) > 3 else ''}")
+            
+            bullet_points = await fetch_amazon_bullet_points(asin, country)
+            
+            if bullet_points:
+                bullet_points_cache[asin_key] = bullet_points
+                logger.info(f"✓ ASIN {asin} 成功获取 {len(bullet_points)} 条五点描述")
+            else:
+                logger.warning(f"✗ ASIN {asin} 未获取到五点描述")
+                crawl_errors.append(f"ASIN {asin} ({country}): 未获取到数据")
+            
+            # 添加延时避免被反爬虫
+            if i < len(asin_to_crawl):
+                await asyncio.sleep(random.uniform(2, 4))
+                
+        except Exception as e:
+            logger.error(f"✗ ASIN {asin} 爬取失败: {e}")
+            crawl_errors.append(f"ASIN {asin} ({country}): {str(e)}")
+    
+    # 输出爬取统计
+    success_count = len(bullet_points_cache)
+    total_count = len(asin_to_crawl)
+    logger.info(f"五点描述预爬取完成: 成功 {success_count}/{total_count} ({success_count/total_count*100:.1f}%)")
+    
+    if crawl_errors:
+        logger.warning(f"爬取失败的ASIN ({len(crawl_errors)}个):")
+        for error in crawl_errors[:5]:  # 只显示前5个错误
+            logger.warning(f"  - {error}")
+        if len(crawl_errors) > 5:
+            logger.warning(f"  ... 还有 {len(crawl_errors) - 5} 个错误")
+    
+    return bullet_points_cache
+
 def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl, enable_multimodal_llm, enable_advanced_bg_removal):
     """静态信息分析：基于本地图片和Excel文件分析产品特征"""
     try:
@@ -1077,7 +1156,16 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
             logger.error("无法从Excel文件中加载数据")
             return
         
+        # 预爬取亚马逊五点描述数据
+        logger.info("=" * 60)
+        logger.info("步骤1: 预爬取亚马逊五点描述数据")
+        logger.info("=" * 60)
+        bullet_points_cache = asyncio.run(pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl))
+        
         # 查找图片文件
+        logger.info("=" * 60)
+        logger.info("步骤2: 扫描图片文件")
+        logger.info("=" * 60)
         image_files = find_image_files(image_folder)
         if not image_files:
             logger.error("图片文件夹中没有找到图片文件")
@@ -1087,7 +1175,9 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
         results = []
         total_files = len(image_files)
         
-        logger.info(f"开始处理 {total_files} 个图片文件")
+        logger.info("=" * 60)
+        logger.info(f"步骤3: 开始分析 {total_files} 个图片文件")
+        logger.info("=" * 60)
         
         # 确保YOLO模型已加载
         _ = get_yolo_model()
@@ -1154,29 +1244,28 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
                         
                         bullet_points = []
                         
-                        # 尝试从亚马逊获取五点描述
-                        if enable_amazon_crawl and asin:
-                            logger.info(f"正在从亚马逊获取ASIN {asin} 的五点描述...")
-                            try:
-                                bullet_points = asyncio.run(fetch_amazon_bullet_points(asin, country))
-                                if bullet_points:
-                                    logger.info(f"成功获取 {len(bullet_points)} 条五点描述")
-                                else:
-                                    logger.warning(f"未能获取ASIN {asin} 的五点描述")
-                            except Exception as e:
-                                logger.error(f"获取ASIN {asin} 五点描述时出错: {e}")
+                        # 从预爬取的缓存中获取五点描述
+                        if asin and asin.strip():
+                            asin_key = f"{asin}_{country}"
+                            if asin_key in bullet_points_cache:
+                                bullet_points = bullet_points_cache[asin_key]
+                                logger.info(f"从缓存获取ASIN {asin} 的 {len(bullet_points)} 条五点描述")
+                            else:
+                                logger.warning(f"缓存中未找到ASIN {asin} ({country}) 的五点描述")
                         
                         # 使用标题和五点描述进行AI分析
                         if title or bullet_points:
-                            logger.info(f"开始AI分析: 标题='{title}', 五点描述数量={len(bullet_points)}")
+                            logger.info(f"开始AI分析: 标题='{title[:50]}...', 五点描述数量={len(bullet_points)}")
                             ai_result = ai_voting_analysis(title, bullet_points)
                             
                             # 记录LLM分析结果
                             llm_color = standardize_color(ai_result.get('color', 'Unknown'))
                             llm_material = standardize_material(ai_result.get('material', 'Unknown'))
                             llm_shape = standardize_shape(ai_result.get('shape', 'Unknown'))
+                            
+                            logger.info(f"AI分析完成: LLM颜色={llm_color}, 材质={llm_material}, 形状={llm_shape}")
                         else:
-                            logger.warning(f"SKU {sku} 缺少标题和ASIN信息，无法进行AI分析")
+                            logger.warning(f"SKU {sku} 缺少标题和五点描述信息，无法进行AI分析")
                         
                     else:
                         logger.warning(f"SKU {sku} 在Excel文件中未找到对应信息")
@@ -1217,11 +1306,11 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
                         'multimodal_llm_shape': multimodal_llm_shape
                     })
                     
-                    logger.info(f"SKU {sku} 处理完成: 最终颜色={final_color}, 材质={final_material}, 形状={final_shape}")
-                    logger.info(f"  分析详情: YOLO颜色={yolo_color}, YOLO形状={yolo_shape}, LLM颜色={llm_color}, LLM形状={llm_shape}, 多模态LLM形状={multimodal_llm_shape}")
+                    logger.info(f"✓ SKU {sku} 处理完成: 颜色={final_color}, 材质={final_material}, 形状={final_shape}")
+                    logger.info(f"  └ 分析详情: YOLO[颜色={yolo_color}, 形状={yolo_shape}] | LLM[颜色={llm_color}, 材质={llm_material}, 形状={llm_shape}] | 多模态[形状={multimodal_llm_shape}]")
                     
-                    # 添加随机延时
-                    time.sleep(random.uniform(1, 2))
+                    # 减少延时，因为不再实时爬取
+                    time.sleep(random.uniform(0.5, 1.0))
                     
                 except Exception as e:
                     logger.error(f"处理图片 {filename} 时出错: {str(e)}")
