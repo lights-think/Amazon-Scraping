@@ -631,7 +631,7 @@ def analyze_shape_with_multimodal_llm(image_path, box=None):
         try:
             # 尝试使用llava模型进行视觉分析
             response = ollama_chat(
-                model='llava:latest',  # 使用LLaVA多模态模型
+                model='gemma3:latest',  # 使用LLaVA多模态模型
                 messages=[{
                     'role': 'user', 
                     'content': prompt,
@@ -1068,7 +1068,8 @@ def load_excel_data(excel_file):
 @click.option('--enable-amazon-crawl', '--amazon', is_flag=True, help='启用亚马逊五点描述爬取功能（需要ASIN列）')
 @click.option('--enable-multimodal-llm', '--llm-shape', is_flag=True, help='启用多模态LLM进行形状识别（实验性功能）')
 @click.option('--enable-advanced-bg-removal', '--advanced-bg', is_flag=True, help='启用高级背景去除技术（基于图像分割和颜色分析）')
-def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl, enable_multimodal_llm, enable_advanced_bg_removal):
+@click.option('--test', is_flag=True, help='测试模式，仅随机抽取50个图片进行分析')
+def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl, enable_multimodal_llm, enable_advanced_bg_removal, test):
     """静态信息分析：基于本地图片和Excel文件分析产品特征"""
     try:
         # 加载Excel数据
@@ -1082,6 +1083,12 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
         if not image_files:
             logger.error("图片文件夹中没有找到图片文件")
             return
+        
+        # 测试模式：随机抽取50个图片
+        if test:
+            sample_size = min(50, len(image_files))
+            image_files = random.sample(image_files, sample_size)
+            logger.info(f"测试模式启用，仅抽取{sample_size}个图片进行分析")
         
         # 准备结果数据
         results = []

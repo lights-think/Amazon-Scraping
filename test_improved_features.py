@@ -54,7 +54,7 @@ def test_multimodal_llm():
         test_prompt = "What shape is a circle? Respond with just 'Round'."
         
         response = ollama_chat(
-            model='llava:latest',
+            model='gemma3:latest',
             messages=[{'role': 'user', 'content': test_prompt}]
         )
         
