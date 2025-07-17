@@ -14,7 +14,7 @@
 - 更轻量，启动更快
 
 CSV输出格式:
-sku,color,material,shape,image_color,geometric_shape,llm_color,llm_material,llm_shape
+sku,color,material,shape,image_color,geometric_shape,llm_color,llm_material,llm_shape,overview_color,overview_material,overview_shape
 
 使用示例:
     # 基础使用
@@ -154,6 +154,45 @@ def standardize_material(value: str) -> str:
 
 def standardize_shape(value: str) -> str:
     return _standardize_attribute(value, STANDARD_SHAPES)
+
+def extract_features_from_overview(product_overview):
+    """从产品概览表格中提取颜色、材质、形状信息"""
+    features = {
+        'color': 'Unknown',
+        'material': 'Unknown', 
+        'shape': 'Unknown'
+    }
+    
+    if not product_overview or not isinstance(product_overview, dict):
+        return features
+    
+    # 定义可能的键名映射
+    color_keys = ['Color', 'Colour', 'color', 'colour', 'Color Name', 'Finish', 'finish']
+    material_keys = ['Material', 'material', 'Materials', 'materials', 'Made of', 'Construction', 'Fabric Type']
+    shape_keys = ['Shape', 'shape', 'Form', 'form', 'Style', 'style', 'Design', 'design']
+    
+    # 提取颜色信息
+    for key in color_keys:
+        if key in product_overview and product_overview[key].strip():
+            features['color'] = standardize_color(product_overview[key])
+            logger.info(f"从产品概览提取颜色: {key} = {product_overview[key]} -> {features['color']}")
+            break
+    
+    # 提取材质信息
+    for key in material_keys:
+        if key in product_overview and product_overview[key].strip():
+            features['material'] = standardize_material(product_overview[key])
+            logger.info(f"从产品概览提取材质: {key} = {product_overview[key]} -> {features['material']}")
+            break
+    
+    # 提取形状信息
+    for key in shape_keys:
+        if key in product_overview and product_overview[key].strip():
+            features['shape'] = standardize_shape(product_overview[key])
+            logger.info(f"从产品概览提取形状: {key} = {product_overview[key]} -> {features['shape']}")
+            break
+    
+    return features
 
 # ========== 图像分析函数（无YOLO版本）==========
 
@@ -429,9 +468,35 @@ async def handle_continue_shopping(page):
         logger.error(f'[CONTINUE_SHOPPING] Exception: {e}')
         return False
 
-async def extract_amazon_bullet_points(page):
-    """从亚马逊页面提取五点描述"""
-    bullet_points = []
+async def extract_amazon_product_info(page):
+    """从亚马逊页面提取完整产品信息：标题、五点描述、产品概览表格和主图"""
+    result = {
+        'title': '',
+        'bullet_points': [],
+        'product_overview': {},
+        'main_image': ''
+    }
+    
+    # 提取标题
+    try:
+        title_element = await page.query_selector("#title")
+        if title_element:
+            title_text = await title_element.inner_text()
+            result['title'] = title_text.strip()
+            logger.info(f"成功提取标题: {result['title'][:50]}...")
+        else:
+            # 尝试使用XPath获取标题
+            title_element = await page.query_selector("//*[@id='title']")
+            if title_element:
+                title_text = await title_element.inner_text()
+                result['title'] = title_text.strip()
+                logger.info(f"成功提取标题(XPath): {result['title'][:50]}...")
+            else:
+                logger.warning("未找到标题元素")
+    except Exception as e:
+        logger.error(f"提取标题时出错: {str(e)}")
+    
+    # 提取五点描述
     try:
         bullet_points_element = await page.query_selector("#feature-bullets")
         if bullet_points_element:
@@ -439,17 +504,142 @@ async def extract_amazon_bullet_points(page):
             for point in points:
                 point_text = await point.inner_text()
                 if point_text.strip():
-                    bullet_points.append(point_text.strip())
-            logger.info(f"成功提取五点描述: 共{len(bullet_points)}点")
+                    result['bullet_points'].append(point_text.strip())
+            logger.info(f"成功提取五点描述: 共{len(result['bullet_points'])}点")
         else:
-            logger.warning("未找到五点描述元素")
+            # 尝试使用XPath获取五点描述
+            bullet_points_element = await page.query_selector("//div[@id='feature-bullets']")
+            if bullet_points_element:
+                points = await bullet_points_element.query_selector_all("ul li span.a-list-item")
+                for point in points:
+                    point_text = await point.inner_text()
+                    if point_text.strip():
+                        result['bullet_points'].append(point_text.strip())
+                logger.info(f"成功提取五点描述(XPath): 共{len(result['bullet_points'])}点")
+            else:
+                logger.warning("未找到五点描述元素")
     except Exception as e:
         logger.error(f"提取五点描述时出错: {str(e)}")
     
-    return bullet_points
+    # 提取产品概览表格（包含颜色、材质、形状等详细信息）
+    try:
+        # 尝试使用CSS选择器获取产品概览表格
+        overview_table = await page.query_selector("#productOverview_feature_div > div > table > tbody")
+        if not overview_table:
+            # 尝试使用XPath获取产品概览表格
+            overview_table = await page.query_selector("xpath=//table[@id='productOverview']//tbody | //div[contains(@id,'productOverview')]//tbody | //table[contains(@class,'prodDetTable')]//tbody")
+            
+        if overview_table:
+            # 获取所有行
+            rows = await overview_table.query_selector_all("tr")
+            for row in rows:
+                try:
+                    # 获取标题单元格和值单元格
+                    title_cell = await row.query_selector("td:first-child span")
+                    value_cell = await row.query_selector("td:last-child span")
+                    
+                    if title_cell and value_cell:
+                        title_text = await title_cell.inner_text()
+                        value_text = await value_cell.inner_text()
+                        
+                        # 去除空白字符
+                        title_text = title_text.strip()
+                        value_text = value_text.strip()
+                        
+                        # 添加到结果中
+                        result['product_overview'][title_text] = value_text
+                except Exception as e:
+                    logger.error(f"提取产品概览行时出错: {str(e)}")
+                    continue
+            
+            logger.info(f"成功提取产品概览表格: 共{len(result['product_overview'])}个属性")
+        else:
+            # 尝试其他可能的选择器
+            alternative_selectors = [
+                "table.a-normal.a-spacing-micro > tbody",
+                "#productDetails_techSpec_section_1 > tbody",
+                "#detailBullets_feature_div > ul",
+                "#productDetails_detailBullets_sections1 > tbody"
+            ]
+            
+            for selector in alternative_selectors:
+                overview_element = await page.query_selector(selector)
+                if overview_element:
+                    if selector.endswith("tbody"):
+                        # 表格形式
+                        rows = await overview_element.query_selector_all("tr")
+                        for row in rows:
+                            try:
+                                # 获取标题单元格和值单元格
+                                title_cell = await row.query_selector("th")
+                                value_cell = await row.query_selector("td")
+                                
+                                if title_cell and value_cell:
+                                    title_text = await title_cell.inner_text()
+                                    value_text = await value_cell.inner_text()
+                                    
+                                    # 去除空白字符
+                                    title_text = title_text.strip()
+                                    value_text = value_text.strip()
+                                    
+                                    # 添加到结果中
+                                    result['product_overview'][title_text] = value_text
+                            except Exception as e:
+                                logger.error(f"提取产品概览行时出错: {str(e)}")
+                                continue
+                    elif selector.endswith("ul"):
+                        # 列表形式
+                        items = await overview_element.query_selector_all("li")
+                        for item in items:
+                            try:
+                                item_text = await item.inner_text()
+                                # 分割键值对
+                                parts = item_text.split(":")
+                                if len(parts) >= 2:
+                                    title_text = parts[0].strip()
+                                    value_text = ":".join(parts[1:]).strip()
+                                    result['product_overview'][title_text] = value_text
+                            except Exception as e:
+                                logger.error(f"提取产品概览项时出错: {str(e)}")
+                                continue
+                    
+                    logger.info(f"成功提取产品概览(替代选择器 {selector}): 共{len(result['product_overview'])}个属性")
+                    break
+            
+            if not result['product_overview']:
+                logger.warning("未找到产品概览表格")
+    except Exception as e:
+        logger.error(f"提取产品概览表格时出错: {str(e)}")
+    
+    # 提取主图链接
+    try:
+        img_element = await page.query_selector('#landingImage')
+        if img_element:
+            src = await img_element.get_attribute('src')
+            if src:
+                result['main_image'] = src.strip()
+            else:
+                # 兜底：尝试data-old-hires属性
+                old_src = await img_element.get_attribute('data-old-hires')
+                if old_src:
+                    result['main_image'] = old_src.strip()
+        else:
+            # 兜底：尝试XPath
+            img_element = await page.query_selector('//img[@id="landingImage"]')
+            if img_element:
+                src = await img_element.get_attribute('src')
+                if src:
+                    result['main_image'] = src.strip()
+        
+        if result['main_image']:
+            logger.info(f"成功提取主图链接: {result['main_image'][:50]}...")
+    except Exception as e:
+        logger.error(f"提取主图链接时出错: {str(e)}")
+    
+    return result
 
-async def fetch_amazon_bullet_points(asin, country='US'):
-    """从亚马逊获取产品的五点描述"""
+async def fetch_amazon_product_data(asin, country='US'):
+    """从亚马逊获取完整产品数据：标题、五点描述、产品概览表格、主图等"""
     domain = DOMAIN_MAP.get(country.upper(), 'amazon.com')
     url = f"https://www.{domain}/dp/{asin}"
     
@@ -466,7 +656,7 @@ async def fetch_amazon_bullet_points(asin, country='US'):
                 "Accept-Language": "en-US,en;q=0.9"
             })
             
-            logger.info(f"正在获取ASIN {asin} 的五点描述: {url}")
+            logger.info(f"正在获取ASIN {asin} 的完整产品信息: {url}")
             await page.goto(url, timeout=60000, wait_until='domcontentloaded')
             
             # 检测并处理"继续购物"确认页面
@@ -478,32 +668,37 @@ async def fetch_amazon_bullet_points(asin, country='US'):
             # 随机延时，模拟人类访问
             await asyncio.sleep(random.uniform(1.0, 2.0))
             
-            # 提取五点描述
-            bullet_points = await extract_amazon_bullet_points(page)
+            # 提取完整产品信息
+            product_info = await extract_amazon_product_info(page)
             
             await browser.close()
             
-            return bullet_points
+            return product_info
             
     except Exception as e:
-        logger.error(f"获取ASIN {asin} 五点描述时出错: {str(e)}")
-        return []
+        logger.error(f"获取ASIN {asin} 产品信息时出错: {str(e)}")
+        return {
+            'title': '',
+            'bullet_points': [],
+            'product_overview': {},
+            'main_image': ''
+        }
 
 # ========== 预爬取函数 ==========
 
 async def pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus=None):
-    """预先爬取需要的亚马逊五点描述数据"""
+    """预先爬取需要的亚马逊产品数据（五点描述、产品概览等）"""
     # 检查是否有可爬取的ASIN
     has_asin = any(info.get('asin', '').strip() for info in sku_info_map.values())
     
     if not enable_amazon_crawl:
         if has_asin:
-            logger.warning("检测到Excel中有ASIN信息，建议启用 --amazon 参数获取五点描述以提高分析准确性")
-        logger.info("未启用亚马逊爬取功能，跳过五点描述预爬取")
+            logger.warning("检测到Excel中有ASIN信息，建议启用 --amazon 参数获取产品详细信息以提高分析准确性")
+        logger.info("未启用亚马逊爬取功能，跳过产品数据预爬取")
         return {}
     
     if not has_asin:
-        logger.warning("Excel文件中没有ASIN信息，无法进行五点描述爬取")
+        logger.warning("Excel文件中没有ASIN信息，无法进行产品数据爬取")
         return {}
     
     # 收集需要爬取的ASIN
@@ -532,16 +727,16 @@ async def pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus=N
             else:
                 asin_to_crawl[asin_key]['skus'].append(sku)
         else:
-            logger.warning(f"SKU {sku} 没有ASIN信息，无法爬取五点描述")
+            logger.warning(f"SKU {sku} 没有ASIN信息，无法爬取产品数据")
     
     if not asin_to_crawl:
         logger.warning("没有找到需要爬取的ASIN信息")
         return {}
     
-    logger.info(f"开始预爬取 {len(asin_to_crawl)} 个不同的ASIN五点描述...")
+    logger.info(f"开始预爬取 {len(asin_to_crawl)} 个不同的ASIN产品数据...")
     
-    # 批量爬取五点描述
-    bullet_points_cache = {}
+    # 批量爬取产品数据
+    product_data_cache = {}
     crawl_errors = []
     
     for i, (asin_key, asin_info) in enumerate(asin_to_crawl.items(), 1):
@@ -552,13 +747,20 @@ async def pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus=N
         try:
             logger.info(f"[{i}/{len(asin_to_crawl)}] 正在爬取ASIN {asin} ({country}) - 关联SKU: {', '.join(skus[:3])}{'...' if len(skus) > 3 else ''}")
             
-            bullet_points = await fetch_amazon_bullet_points(asin, country)
+            product_data = await fetch_amazon_product_data(asin, country)
             
-            if bullet_points:
-                bullet_points_cache[asin_key] = bullet_points
-                logger.info(f"✓ ASIN {asin} 成功获取 {len(bullet_points)} 条五点描述")
+            if product_data and (product_data.get('bullet_points') or product_data.get('product_overview')):
+                product_data_cache[asin_key] = product_data
+                bullet_count = len(product_data.get('bullet_points', []))
+                overview_count = len(product_data.get('product_overview', {}))
+                logger.info(f"✓ ASIN {asin} 成功获取: {bullet_count}条五点描述, {overview_count}个产品概览属性")
+                
+                # 打印获取到的产品概览信息（用于调试）
+                overview = product_data.get('product_overview', {})
+                if overview:
+                    logger.info(f"  产品概览: {list(overview.keys())[:5]}{'...' if len(overview) > 5 else ''}")
             else:
-                logger.warning(f"✗ ASIN {asin} 未获取到五点描述")
+                logger.warning(f"✗ ASIN {asin} 未获取到有效产品数据")
                 crawl_errors.append(f"ASIN {asin} ({country}): 未获取到数据")
             
             # 添加延时避免被反爬虫
@@ -570,11 +772,11 @@ async def pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus=N
             crawl_errors.append(f"ASIN {asin} ({country}): {str(e)}")
     
     # 输出爬取统计
-    success_count = len(bullet_points_cache)
+    success_count = len(product_data_cache)
     total_count = len(asin_to_crawl)
-    logger.info(f"五点描述预爬取完成: 成功 {success_count}/{total_count} ({success_count/total_count*100:.1f}%)")
+    logger.info(f"产品数据预爬取完成: 成功 {success_count}/{total_count} ({success_count/total_count*100:.1f}%)")
     
-    return bullet_points_cache
+    return product_data_cache
 
 # ========== 工具函数 ==========
 
@@ -682,11 +884,11 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
         
         logger.info(f"确定需要分析的SKU数量: {len(target_skus)}")
         
-        # 预爬取亚马逊五点描述数据
+        # 预爬取亚马逊产品数据
         logger.info("=" * 60)
-        logger.info("步骤2: 预爬取亚马逊五点描述数据")
+        logger.info("步骤2: 预爬取亚马逊产品数据（五点描述+产品概览）")
         logger.info("=" * 60)
-        bullet_points_cache = asyncio.run(pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus))
+        product_data_cache = asyncio.run(pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus))
         
         # 准备结果数据
         results = []
@@ -714,6 +916,9 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
                     llm_color = 'Unknown'
                     llm_material = 'Unknown'
                     llm_shape = 'Unknown'
+                    overview_color = 'Unknown'
+                    overview_material = 'Unknown'
+                    overview_shape = 'Unknown'
                     
                     # 图像分析（直接分析整张图片，无需YOLO）
                     image_color = get_dominant_color_from_image(image_path)
@@ -729,15 +934,26 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
                         country = sku_info.get('country', 'US')
                         
                         bullet_points = []
+                        product_overview = {}
                         
-                        # 从预爬取的缓存中获取五点描述
+                        # 从预爬取的缓存中获取产品数据
                         if asin and asin.strip():
                             asin_key = f"{asin}_{country}"
-                            if asin_key in bullet_points_cache:
-                                bullet_points = bullet_points_cache[asin_key]
-                                logger.info(f"从缓存获取ASIN {asin} 的 {len(bullet_points)} 条五点描述")
+                            if asin_key in product_data_cache:
+                                product_data = product_data_cache[asin_key]
+                                bullet_points = product_data.get('bullet_points', [])
+                                product_overview = product_data.get('product_overview', {})
+                                logger.info(f"从缓存获取ASIN {asin} 的产品数据: {len(bullet_points)}条五点描述, {len(product_overview)}个概览属性")
                             else:
-                                logger.warning(f"缓存中未找到ASIN {asin} ({country}) 的五点描述")
+                                logger.warning(f"缓存中未找到ASIN {asin} ({country}) 的产品数据")
+                        
+                        # 从产品概览中提取特征信息
+                        if product_overview:
+                            overview_features = extract_features_from_overview(product_overview)
+                            overview_color = overview_features['color']
+                            overview_material = overview_features['material']
+                            overview_shape = overview_features['shape']
+                            logger.info(f"产品概览特征: 颜色={overview_color}, 材质={overview_material}, 形状={overview_shape}")
                         
                         # 使用标题和五点描述进行AI分析
                         if title or bullet_points:
@@ -756,10 +972,10 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
                     else:
                         logger.warning(f"SKU {sku} 在Excel文件中未找到对应信息")
                     
-                    # 生成最终结果（优先级：AI > 图像分析）
-                    final_color = llm_color if llm_color != 'Unknown' else image_color
-                    final_material = llm_material  # 材质主要依赖AI分析
-                    final_shape = llm_shape if llm_shape != 'Unknown' else geometric_shape
+                    # 生成最终结果（优先级：产品概览 > AI > 图像分析）
+                    final_color = overview_color if overview_color != 'Unknown' else (llm_color if llm_color != 'Unknown' else image_color)
+                    final_material = overview_material if overview_material != 'Unknown' else llm_material  # 材质优先使用产品概览，其次AI分析
+                    final_shape = overview_shape if overview_shape != 'Unknown' else (llm_shape if llm_shape != 'Unknown' else geometric_shape)
                     
                     # 标准化最终结果
                     final_color = standardize_color(final_color)
@@ -772,6 +988,9 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
                     llm_color = standardize_color(llm_color)
                     llm_material = standardize_material(llm_material)
                     llm_shape = standardize_shape(llm_shape)
+                    overview_color = standardize_color(overview_color)
+                    overview_material = standardize_material(overview_material)
+                    overview_shape = standardize_shape(overview_shape)
                     
                     # 添加到结果
                     results.append({
@@ -786,11 +1005,15 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
                         # LLM分析结果
                         'llm_color': llm_color,
                         'llm_material': llm_material,
-                        'llm_shape': llm_shape
+                        'llm_shape': llm_shape,
+                        # 产品概览结果
+                        'overview_color': overview_color,
+                        'overview_material': overview_material,
+                        'overview_shape': overview_shape
                     })
                     
                     logger.info(f"✓ SKU {sku} 处理完成: 颜色={final_color}, 材质={final_material}, 形状={final_shape}")
-                    logger.info(f"  └ 分析详情: 图像[颜色={image_color}, 形状={geometric_shape}] | LLM[颜色={llm_color}, 材质={llm_material}, 形状={llm_shape}]")
+                    logger.info(f"  └ 分析详情: 图像[颜色={image_color}, 形状={geometric_shape}] | LLM[颜色={llm_color}, 材质={llm_material}, 形状={llm_shape}] | 概览[颜色={overview_color}, 材质={overview_material}, 形状={overview_shape}]")
                     
                     # 减少延时
                     time.sleep(random.uniform(0.5, 1.0))
@@ -808,7 +1031,10 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
                         'geometric_shape': 'Unknown',
                         'llm_color': 'Unknown',
                         'llm_material': 'Unknown',
-                        'llm_shape': 'Unknown'
+                        'llm_shape': 'Unknown',
+                        'overview_color': 'Unknown',
+                        'overview_material': 'Unknown',
+                        'overview_shape': 'Unknown'
                     })
             
             # 每批次保存一次临时结果
