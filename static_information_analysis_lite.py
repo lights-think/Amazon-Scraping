@@ -2,14 +2,20 @@
 静态信息分析工具 - 轻量版（无YOLO依赖）
 
 核心功能:
-1. 直接颜色分析: 使用K-means聚类分析整张图片的主色调
+1. 智能颜色分析: 使用K-means聚类分析整张图片的主色调，新增边缘权重法减少白色背景误判
 2. 几何形状识别: 使用OpenCV轮廓分析、椭圆拟合、顶点检测等方法
 3. 亚马逊五点描述爬取: 获取详细产品信息
 4. AI文本分析: 使用Ollama的gemma3:latest模型进行材质、颜色、形状识别
 
+新增特性:
+- 边缘权重法: 对图像中心区域赋予更高权重，边缘区域权重递减，有效减少白色背景对颜色分析的干扰
+- 高斯衰减权重: 使用高斯函数实现平滑的权重过渡，中心权重是边缘权重的约10倍
+- 智能采样: 按权重概率采样像素，提高分析效率的同时保持准确性
+
 优势:
 - 无需YOLO模型，减少依赖和安装复杂度
 - 直接分析整张图片，适用于产品图片（通常主体就是产品）
+- 智能处理白色背景，减少颜色误判
 - 保持完整的AI分析能力
 - 更轻量，启动更快
 
@@ -17,11 +23,14 @@ CSV输出格式:
 sku,color,material,shape,image_color,geometric_shape,llm_color,llm_material,llm_shape,overview_color,overview_material,overview_shape
 
 使用示例:
-    # 基础使用
+    # 基础使用（默认启用边缘权重法）
     python static_information_analysis_lite.py -e products.xlsx
     
     # 启用亚马逊产品信息爬取（默认5线程并发）
     python static_information_analysis_lite.py -e products.xlsx --amazon
+    
+    # 禁用边缘权重法，使用原始等权重分析
+    python static_information_analysis_lite.py -e products.xlsx --amazon --disable-edge-weighting
     
     # 自定义并发数爬取
     python static_information_analysis_lite.py -e products.xlsx --amazon -c 3
@@ -199,9 +208,15 @@ def extract_features_from_overview(product_overview):
 
 # ========== 图像分析函数（无YOLO版本）==========
 
-def get_dominant_color_from_image(image_path, k=3):
+def get_dominant_color_from_image(image_path, k=3, use_edge_weighting=True):
     """
     直接从整张图片获取主色调并映射到标准色彩（无需YOLO检测框）
+    新增边缘权重法，减少白色背景误判
+    
+    Args:
+        image_path: 图片路径
+        k: K-means聚类数量
+        use_edge_weighting: 是否使用边缘权重法（默认True）
     """
     try:
         # 读取图像
@@ -210,12 +225,55 @@ def get_dominant_color_from_image(image_path, k=3):
             logger.warning(f"无法读取图片: {image_path}")
             return 'Unknown'
         
-        # 转换颜色空间并重塑为像素向量
+        # 转换颜色空间
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img_pixels = img_rgb.reshape((-1, 3))
+        h, w = img_rgb.shape[:2]
+        
+        if use_edge_weighting:
+            # 边缘权重法：创建权重掩码，中心权重高，边缘权重低
+            logger.info(f"使用边缘权重法分析图片颜色: {image_path}")
+            
+            # 创建距离中心的权重矩阵
+            center_y, center_x = h // 2, w // 2
+            y_coords, x_coords = np.ogrid[:h, :w]
+            
+            # 计算每个像素到中心的归一化距离
+            max_dist = np.sqrt((h/2)**2 + (w/2)**2)
+            distances = np.sqrt((y_coords - center_y)**2 + (x_coords - center_x)**2) / max_dist
+            
+            # 创建权重：中心权重为1，边缘权重递减到0.1
+            # 使用高斯衰减函数，让权重平滑过渡
+            weights = np.exp(-2 * distances**2)  # 高斯衰减
+            weights = np.maximum(weights, 0.1)   # 最小权重0.1，避免边缘完全忽略
+            
+            # 重塑权重矩阵
+            weights_flat = weights.flatten()
+            
+            # 重塑图像像素
+            img_pixels = img_rgb.reshape((-1, 3))
+            
+            # 根据权重采样像素（权重越高，采样概率越大）
+            num_samples = min(50000, len(img_pixels))  # 限制采样数量提高效率
+            probabilities = weights_flat / np.sum(weights_flat)
+            
+            # 按权重概率采样像素
+            sample_indices = np.random.choice(
+                len(img_pixels), 
+                size=num_samples, 
+                replace=True, 
+                p=probabilities
+            )
+            sampled_pixels = img_pixels[sample_indices]
+            
+            logger.info(f"权重采样完成: 从{len(img_pixels)}个像素中采样{num_samples}个，中心权重比边缘高{weights[center_y, center_x]/weights[0, 0]:.1f}倍")
+            
+        else:
+            # 原始方法：等权重处理所有像素
+            sampled_pixels = img_rgb.reshape((-1, 3))
+            logger.info(f"使用原始等权重方法分析图片颜色: {image_path}")
         
         # 使用K-means聚类找到主色调
-        kmeans = KMeans(n_clusters=k, n_init=3, random_state=42).fit(img_pixels)
+        kmeans = KMeans(n_clusters=k, n_init=3, random_state=42).fit(sampled_pixels)
         counts = np.bincount(kmeans.labels_)
         dominant_color = kmeans.cluster_centers_[np.argmax(counts)]
         
@@ -226,7 +284,8 @@ def get_dominant_color_from_image(image_path, k=3):
             if dist < min_dist:
                 min_dist, best_color = dist, color_name
         
-        logger.info(f"图片主色分析结果: {best_color}, RGB={dominant_color}")
+        method_info = "边缘权重法" if use_edge_weighting else "等权重法"
+        logger.info(f"图片主色分析结果({method_info}): {best_color}, RGB={dominant_color}")
         return best_color
         
     except Exception as e:
@@ -873,8 +932,9 @@ def load_excel_data(excel_file):
 @click.option('--batch-size', '-b', 'batch_size', default=10, type=int, help='每次处理的批次大小')
 @click.option('--enable-amazon-crawl', '--amazon', is_flag=True, help='启用亚马逊产品信息爬取功能（强烈推荐）')
 @click.option('--crawl-concurrency', '-c', 'crawl_concurrency', default=5, type=int, help='亚马逊爬取并发数（默认5线程）')
+@click.option('--disable-edge-weighting', '--no-edge-weight', is_flag=True, help='禁用边缘权重法，使用原始等权重颜色分析（默认启用边缘权重法以减少白色背景误判）')
 @click.option('--test', is_flag=True, help='测试模式，仅随机抽取50个图片进行分析')
-def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl, crawl_concurrency, test):
+def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl, crawl_concurrency, disable_edge_weighting, test):
     """静态信息分析：轻量版 - 无YOLO依赖的产品特征分析"""
     try:
         # 加载Excel数据
@@ -943,7 +1003,9 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
                     overview_shape = 'Unknown'
                     
                     # 图像分析（直接分析整张图片，无需YOLO）
-                    image_color = get_dominant_color_from_image(image_path)
+                    # 边缘权重法：默认启用，可通过--disable-edge-weighting禁用
+                    use_edge_weighting = not disable_edge_weighting
+                    image_color = get_dominant_color_from_image(image_path, use_edge_weighting=use_edge_weighting)
                     geometric_shape = analyze_shape_from_image(image_path)
                     
                     logger.info(f"图像分析完成: 颜色={image_color}, 形状={geometric_shape}")
