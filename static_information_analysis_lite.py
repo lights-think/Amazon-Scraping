@@ -20,8 +20,11 @@ sku,color,material,shape,image_color,geometric_shape,llm_color,llm_material,llm_
     # 基础使用
     python static_information_analysis_lite.py -e products.xlsx
     
-    # 启用亚马逊五点描述爬取
+    # 启用亚马逊产品信息爬取（默认5线程并发）
     python static_information_analysis_lite.py -e products.xlsx --amazon
+    
+    # 自定义并发数爬取
+    python static_information_analysis_lite.py -e products.xlsx --amazon -c 3
     
     # 测试模式
     python static_information_analysis_lite.py -e products.xlsx --amazon --test
@@ -686,8 +689,38 @@ async def fetch_amazon_product_data(asin, country='US'):
 
 # ========== 预爬取函数 ==========
 
-async def pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus=None):
-    """预先爬取需要的亚马逊产品数据（五点描述、产品概览等）"""
+async def fetch_single_product_data(semaphore, asin, country, skus, results_dict, errors_list):
+    """单个产品数据爬取任务（带并发控制）"""
+    async with semaphore:
+        asin_key = f"{asin}_{country}"
+        try:
+            logger.info(f"正在爬取ASIN {asin} ({country}) - 关联SKU: {', '.join(skus[:3])}{'...' if len(skus) > 3 else ''}")
+            
+            product_data = await fetch_amazon_product_data(asin, country)
+            
+            if product_data and (product_data.get('bullet_points') or product_data.get('product_overview')):
+                results_dict[asin_key] = product_data
+                bullet_count = len(product_data.get('bullet_points', []))
+                overview_count = len(product_data.get('product_overview', {}))
+                logger.info(f"✓ ASIN {asin} 成功获取: {bullet_count}条五点描述, {overview_count}个产品概览属性")
+                
+                # 打印获取到的产品概览信息（用于调试）
+                overview = product_data.get('product_overview', {})
+                if overview:
+                    logger.info(f"  产品概览: {list(overview.keys())[:5]}{'...' if len(overview) > 5 else ''}")
+            else:
+                logger.warning(f"✗ ASIN {asin} 未获取到有效产品数据")
+                errors_list.append(f"ASIN {asin} ({country}): 未获取到数据")
+            
+            # 添加随机延时避免被反爬虫
+            await asyncio.sleep(random.uniform(1, 3))
+                
+        except Exception as e:
+            logger.error(f"✗ ASIN {asin} 爬取失败: {e}")
+            errors_list.append(f"ASIN {asin} ({country}): {str(e)}")
+
+async def pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus=None, concurrency=5):
+    """预先爬取需要的亚马逊产品数据（五点描述、产品概览等），默认5线程并发"""
     # 检查是否有可爬取的ASIN
     has_asin = any(info.get('asin', '').strip() for info in sku_info_map.values())
     
@@ -733,48 +766,36 @@ async def pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus=N
         logger.warning("没有找到需要爬取的ASIN信息")
         return {}
     
-    logger.info(f"开始预爬取 {len(asin_to_crawl)} 个不同的ASIN产品数据...")
+    logger.info(f"开始预爬取 {len(asin_to_crawl)} 个不同的ASIN产品数据，并发数: {concurrency}")
     
-    # 批量爬取产品数据
+    # 创建并发控制的信号量
+    semaphore = asyncio.Semaphore(concurrency)
     product_data_cache = {}
     crawl_errors = []
     
-    for i, (asin_key, asin_info) in enumerate(asin_to_crawl.items(), 1):
+    # 创建并发任务列表
+    tasks = []
+    for asin_key, asin_info in asin_to_crawl.items():
         asin = asin_info['asin']
         country = asin_info['country']
         skus = asin_info['skus']
         
-        try:
-            logger.info(f"[{i}/{len(asin_to_crawl)}] 正在爬取ASIN {asin} ({country}) - 关联SKU: {', '.join(skus[:3])}{'...' if len(skus) > 3 else ''}")
-            
-            product_data = await fetch_amazon_product_data(asin, country)
-            
-            if product_data and (product_data.get('bullet_points') or product_data.get('product_overview')):
-                product_data_cache[asin_key] = product_data
-                bullet_count = len(product_data.get('bullet_points', []))
-                overview_count = len(product_data.get('product_overview', {}))
-                logger.info(f"✓ ASIN {asin} 成功获取: {bullet_count}条五点描述, {overview_count}个产品概览属性")
-                
-                # 打印获取到的产品概览信息（用于调试）
-                overview = product_data.get('product_overview', {})
-                if overview:
-                    logger.info(f"  产品概览: {list(overview.keys())[:5]}{'...' if len(overview) > 5 else ''}")
-            else:
-                logger.warning(f"✗ ASIN {asin} 未获取到有效产品数据")
-                crawl_errors.append(f"ASIN {asin} ({country}): 未获取到数据")
-            
-            # 添加延时避免被反爬虫
-            if i < len(asin_to_crawl):
-                await asyncio.sleep(random.uniform(2, 4))
-                
-        except Exception as e:
-            logger.error(f"✗ ASIN {asin} 爬取失败: {e}")
-            crawl_errors.append(f"ASIN {asin} ({country}): {str(e)}")
+        task = fetch_single_product_data(
+            semaphore, asin, country, skus, 
+            product_data_cache, crawl_errors
+        )
+        tasks.append(task)
+    
+    # 等待所有任务完成
+    await asyncio.gather(*tasks)
     
     # 输出爬取统计
     success_count = len(product_data_cache)
     total_count = len(asin_to_crawl)
     logger.info(f"产品数据预爬取完成: 成功 {success_count}/{total_count} ({success_count/total_count*100:.1f}%)")
+    
+    if crawl_errors:
+        logger.warning(f"爬取失败的ASIN数量: {len(crawl_errors)}")
     
     return product_data_cache
 
@@ -850,9 +871,10 @@ def load_excel_data(excel_file):
 @click.option('--excel-file', '-e', required=True, help='Excel文件路径，包含product_sku列，可选ASIN、country、product_title_en列')
 @click.option('--output', '-o', 'output_file', default='static_features_lite.csv', help='输出CSV文件路径')
 @click.option('--batch-size', '-b', 'batch_size', default=10, type=int, help='每次处理的批次大小')
-@click.option('--enable-amazon-crawl', '--amazon', is_flag=True, help='启用亚马逊五点描述爬取功能（强烈推荐）')
+@click.option('--enable-amazon-crawl', '--amazon', is_flag=True, help='启用亚马逊产品信息爬取功能（强烈推荐）')
+@click.option('--crawl-concurrency', '-c', 'crawl_concurrency', default=5, type=int, help='亚马逊爬取并发数（默认5线程）')
 @click.option('--test', is_flag=True, help='测试模式，仅随机抽取50个图片进行分析')
-def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl, test):
+def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl, crawl_concurrency, test):
     """静态信息分析：轻量版 - 无YOLO依赖的产品特征分析"""
     try:
         # 加载Excel数据
@@ -888,7 +910,7 @@ def main(image_folder, excel_file, output_file, batch_size, enable_amazon_crawl,
         logger.info("=" * 60)
         logger.info("步骤2: 预爬取亚马逊产品数据（五点描述+产品概览）")
         logger.info("=" * 60)
-        product_data_cache = asyncio.run(pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus))
+        product_data_cache = asyncio.run(pre_crawl_amazon_data(sku_info_map, enable_amazon_crawl, target_skus, crawl_concurrency))
         
         # 准备结果数据
         results = []
